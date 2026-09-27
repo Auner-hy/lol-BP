@@ -142,6 +142,7 @@ class CounterPickerApp:
         self._snap = None
         self._manual = False
         self._lane = ""
+        self._online_pending = False  # 本轮是否正在等待在线数据（用于头像延后）
         self._row_widgets: list[tk.Widget] = []
         self._enemy_widgets: list[tk.Widget] = []
 
@@ -380,23 +381,32 @@ class CounterPickerApp:
                     self._rec_key = key
                     self._rec_gen += 1
                     gen = self._rec_gen
-                    # 1) 离线表立即出首帧（零等待）
-                    off_recs, off_src = self.engine.recommender.recommend_offline(
+                    # 1) 磁盘缓存优先：6 小时内看过同一对位直接秒出，不发网络
+                    cached_recs, cached_src = self.engine.recommender.recommend_cached(
                         target, lane or "top")
-                    if off_recs:
-                        self._last_recs = (off_recs, off_src)
+                    if cached_recs:
+                        self._last_recs = (cached_recs, cached_src)
+                        self._online_pending = False
                     else:
-                        self._last_recs = ([], "")
-                    self.q.put(("computing", None))
-                    # 2) 在线源后台并行竞速，拉到后替换
-                    def on_online(recs, src, _gen=gen, _key=key):
-                        if _gen == self._rec_gen and _key == self._rec_key:
-                            self.q.put(("recs_online", (recs, src)))
-                    self.engine.recommender.recommend_async(
-                        target, lane or "top", on_online=on_online, quick_timeout=8.0)
+                        # 2) 无缓存：离线表立即出首帧（零等待）
+                        off_recs, off_src = self.engine.recommender.recommend_offline(
+                            target, lane or "top")
+                        if off_recs:
+                            self._last_recs = (off_recs, off_src)
+                        else:
+                            self._last_recs = ([], "")
+                        self.q.put(("computing", None))
+                        # 3) 在线源后台并行竞速（超时5秒），拉到后替换
+                        def on_online(recs, src, _gen=gen, _key=key):
+                            if _gen == self._rec_gen and _key == self._rec_key:
+                                self.q.put(("recs_online", (recs, src)))
+                        self.engine.recommender.recommend_async(
+                            target, lane or "top", on_online=on_online, quick_timeout=5.0)
+                        self._online_pending = True
                 elif not target:
                     self._rec_key = None
                     self._last_recs = ([], "")
+                    self._online_pending = False
 
                 # 预下载本次需要的高清头像
                 ens: dict[int, str] = {}
@@ -413,7 +423,10 @@ class CounterPickerApp:
                     if info:
                         ens[target] = info["en"]
                 for c in self._last_recs[0]:
-                    ens[c.champion_id] = self.engine.db.en_of(c.champion_id)
+                    # 正在拉在线数据时跳过推荐头像：避免与排行榜请求抢带宽；
+                    # 下一轮（数据已就绪）会自动补下载
+                    if not self._online_pending:
+                        ens[c.champion_id] = self.engine.db.en_of(c.champion_id)
                 got_new = False
                 for cid, en in ens.items():
                     if download_avatar(cid, en, self.engine.db.version or "",
@@ -571,7 +584,8 @@ class CounterPickerApp:
                 text="正在获取对位数据…\n（国内网络访问国际数据源较慢时，\n"
                      "会自动切换到内置离线克制表）")
             self.lbl_hint.pack(pady=sp(30))
-            self.lbl_source.configure(text=source or "等待数据")
+            self.lbl_source.configure(
+                text=source or "在线数据获取中…（通常 3～5 秒）")
             return
 
         rank_colors = {1: GOLD, 2: "#C0C0C0", 3: "#CD7F32"}
