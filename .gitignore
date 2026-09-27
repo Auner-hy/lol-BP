@@ -1,0 +1,16 @@
+# ===== Python 运行缓存（Python自动生成的字节码文件，无用） =====
+__pycache__/
+*.pyc
+
+# ===== PyInstaller 打包中间产物（build_exe.bat 会自动重新生成） =====
+build/
+dist/
+
+# ===== 打包生成的 exe 分发压缩包（20MB，可用源码重新生成） =====
+*.zip
+
+# ===== 系统/编辑器杂项文件 =====
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
