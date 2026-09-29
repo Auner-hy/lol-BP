@@ -24,7 +24,7 @@ if errorlevel 1 (
 
 echo.
 echo [2/3] Building EXE with PyInstaller (takes 1-3 minutes) ...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name LOLCounterPicker run_app.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name LOLCounterPicker --distpath . run_app.py
 if errorlevel 1 (
     echo [ERROR] PyInstaller build failed. Scroll up for details.
     pause
@@ -34,7 +34,7 @@ if errorlevel 1 (
 echo.
 echo [3/3] Done.
 echo ============================================================
-echo   EXE file : dist\LOLCounterPicker.exe        (test it first)
+echo   EXE file : LOLCounterPicker.exe  (in this folder, test it first)
 echo.
 echo   No local zip is created. To distribute, upload the exe as
 echo   an asset of the corresponding GitHub Release.
