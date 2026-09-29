@@ -165,6 +165,8 @@ class CounterPickerApp:
         self._manual = False
         self._lane = ""
         self._online_pending = False  # 本轮是否正在等待在线数据（用于头像延后）
+        self._render_sig = None       # 推荐页上一次渲染的数据签名（相同则跳过重绘）
+        self._avatar_slots = {}       # 头像原地刷新槽位：slot_key -> [label,cid,en,size,bg]
         self._ban_mode = False        # 当前榜单是否为"我方英雄受克制榜"（锁定Ban推荐）
         # 符文出装
         self._build_info = None       # 当前 BuildInfo（None=未加载）
@@ -283,10 +285,17 @@ class CounterPickerApp:
         nb_style.map("TNotebook.Tab",
                      background=[("selected", CARD)],
                      foreground=[("selected", GOLD)])
-        self.lbl_footer = tk.Label(self.root, text="", bg=BG, fg=MUTED,
+        footer = tk.Frame(self.root, bg=BG)
+        footer.pack(side="bottom", fill="x", padx=sp(14),
+                    pady=(sp(2), sp(10)))
+        self.lbl_footer = tk.Label(footer, text="", bg=BG, fg=MUTED,
                                    font=fnt(8), anchor="w")
-        self.lbl_footer.pack(side="bottom", fill="x", padx=sp(14),
-                             pady=(sp(2), sp(10)))
+        self.lbl_footer.pack(side="left")
+        # 时钟单独一个标签，由 _tick_clock 每秒更新，不随整页重绘
+        self.lbl_clock = tk.Label(footer, text="", bg=BG, fg=MUTED,
+                                  font=fnt(8), anchor="e")
+        self.lbl_clock.pack(side="right")
+        self._tick_clock()
 
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=sp(12), pady=(0, sp(4)))
@@ -490,8 +499,10 @@ class CounterPickerApp:
             return img
         return None
 
-    def _avatar_label(self, parent, cid: int, en: str, size: int, bg=CARD2) -> tk.Label:
-        """创建英雄头像标签；无头像时显示带问号的占位块。"""
+    def _avatar_label(self, parent, cid: int, en: str, size: int,
+                       bg=CARD2, slot_key=None) -> tk.Label:
+        """创建英雄头像标签；无头像时显示带问号的占位块。
+        slot_key 不为空时登记到原地刷新槽位，头像下载完即可只更新这一个控件。"""
         lbl = tk.Label(parent, bg=bg)
         img = self._get_photo(cid, en, size)
         if img:
@@ -500,8 +511,48 @@ class CounterPickerApp:
             lbl.configure(image=self._placeholder(size, bg), text="?", fg=MUTED,
                           compound="center", font=fnt(10, "bold"),
                           width=sp(size), height=sp(size))
+        if slot_key is not None:
+            self._avatar_slots[slot_key] = [lbl, cid, en, size, bg]
         return lbl
 
+    def _refresh_avatars(self, ids):
+        """给定刚下载好头像的英雄ID列表，只更新对应头像标签（原地，不重绘）。"""
+        wanted = set(ids)
+        for key, slot in list(self._avatar_slots.items()):
+            lbl, cid, en, size, bg = slot
+            if cid not in wanted:
+                continue
+            img = self._get_photo(cid, en, size)  # 已缓存，直接返回
+            if img:
+                try:
+                    lbl.configure(image=img, text="", width=sp(size),
+                                  height=sp(size))
+                    lbl.image = img
+                except tk.TclError:
+                    pass
+
+    def _tick_clock(self):
+        """每秒刷新右下角时钟；只改这一个标签，不触发整页重绘。"""
+        self.lbl_clock.configure(text=time.strftime("%H:%M:%S"))
+        self.root.after(1000, self._tick_clock)
+
+    def _state_signature(self):
+        """生成当前推荐页数据签名；签名不变说明界面无需重绘，用于消除周期性闪烁。"""
+        snap = self._snap
+        recs = self._last_recs[0]
+        ban = self._ban_mode
+        target = (snap.my_champ_id or snap.my_pick_intent_id) if ban \
+            else (self.engine.target_enemy(snap) if snap else 0)
+        rec_tup = tuple((c.champion_id, round(c.my_winrate, 2),
+                        round(c.enemy_winrate, 2)) for c in recs)
+        allies_tup = tuple(a.champion_id for a in snap.allies) if snap else ()
+        enemies_tup = tuple(e.champion_id for e in snap.enemies) if snap else ()
+        bans_tup = tuple(snap.bans) if snap else ()
+        phase = snap.phase if snap else "none"
+        my_id = (snap.my_champ_id or snap.my_pick_intent_id) if snap else 0
+        lane = snap.my_lane if snap else ""
+        return (phase, ban, target, my_id, lane, allies_tup, enemies_tup,
+                bans_tup, rec_tup)
     # ---------------- 后台线程 ----------------
     def _worker(self):
         """后台主循环（独立线程）：定时轮询客户端，产出对位推荐、符文出装、
@@ -510,12 +561,14 @@ class CounterPickerApp:
             try:
                 snap = self.engine.poll()
                 manual = bool(self.engine.manual_enemy_id)
-                # 查询模式：手动点选/敌方已锁定 -> 对位推荐（counter）；
-                # 我方已锁定但敌方还没目标 -> 显示"最克制我方英雄"的受克制榜（ban）
-                ban_mode = (not manual) and bool(snap.my_champ_id) and not snap.auto_enemy_id
+                # 我方英雄：已锁定优先，未锁定时用预选(选择意向)英雄
+                my_id = snap.my_champ_id or snap.my_pick_intent_id
+                # ban 模式：非手动查询 + 我方已有英雄(锁定/预选) + 敌方还没有对位目标
+                ban_mode = (not manual) and bool(my_id) and not snap.auto_enemy_id
+                # intent_only = 仅"点击预选"、尚未锁定（悬停不会触发）
+                intent_only = bool(ban_mode and not snap.my_champ_id)
                 if ban_mode:
-                    target = snap.my_champ_id
-                    # 用我方分路查对位数据；分路未知则按英雄定位粗略猜测
+                    target = my_id
                     lane = snap.my_lane or self._guess_lane(target)
                 else:
                     target = self.engine.target_enemy(snap)
@@ -537,23 +590,22 @@ class CounterPickerApp:
                         # 2) 无缓存：离线表立即出首帧（零等待）
                         off_recs, off_src = self.engine.recommender.recommend_offline(
                             target, lane or "top")
-                        if off_recs:
-                            self._last_recs = (off_recs, off_src)
-                        else:
-                            self._last_recs = ([], "")
+                        self._last_recs = (off_recs, off_src) if off_recs else ([], "")
                         self.q.put(("computing", None))
-                        # 3) 在线源后台并行竞速（超时5秒），拉到后替换
+                        # 3) 在线更新：点击预选或锁定后立即拉取，拿到再原地替换
                         def on_online(recs, src, _gen=gen, _key=key):
                             if _gen == self._rec_gen and _key == self._rec_key:
                                 self.q.put(("recs_online", (recs, src)))
                         self.engine.recommender.recommend_async(
-                            target, lane or "top", on_online=on_online, quick_timeout=5.0)
+                            target, lane or "top", on_online=on_online,
+                            quick_timeout=5.0)
                         self._online_pending = True
                 elif not target:
                     self._rec_key = None
                     self._last_recs = ([], "")
                     self._online_pending = False
                     self._ban_mode = False
+
 
                 # ---- 符文出装：优先展示我方英雄；我方未知时展示对位目标 ----
                 build_cid = (snap.my_champ_id
@@ -591,12 +643,14 @@ class CounterPickerApp:
                         self._build_info = None
                         self.q.put(("build_hide", None))
 
-                # 预下载本次需要的高清头像
+                # ---- 收集本次界面需要的英雄头像 ----
                 ens: dict[int, str] = {}
-                if snap.my_champ_id:
-                    info = self.engine.db.by_champion_id(snap.my_champ_id)
+                # 我方英雄：锁定优先，否则预选英雄
+                my_show_id = snap.my_champ_id or snap.my_pick_intent_id
+                if my_show_id:
+                    info = self.engine.db.by_champion_id(my_show_id)
                     if info:
-                        ens[snap.my_champ_id] = info["en"]
+                        ens[my_show_id] = info["en"]
                 for e in snap.enemies:
                     info = self.engine.db.by_champion_id(e.champion_id)
                     if info:
@@ -609,19 +663,31 @@ class CounterPickerApp:
                     # ban 模式下跳过已被 ban 的英雄
                     if ban_mode and c.champion_id in snap.bans:
                         continue
-                    # 正在拉在线数据时跳过推荐头像：避免与排行榜请求抢带宽；
-                    # 下一轮（数据已就绪）会自动补下载
+                    # 正在拉在线数据时跳过推荐头像：避免与排行榜请求抢带宽
                     if not self._online_pending:
                         ens[c.champion_id] = self.engine.db.en_of(c.champion_id)
-                got_new = False
-                for cid, en in ens.items():
-                    if download_avatar(cid, en, self.engine.db.version or "",
-                                       self.cfg.http_timeout):
-                        got_new = True
+                # 只保留本地缺失的头像，避免对已有文件做无谓判断
+                missing = {c: e for c, e in ens.items()
+                           if not (_avatar_path(c).exists()
+                                   and _avatar_path(c).stat().st_size > 1000)}
+                # state 先下发：界面先用占位块即时响应（点击不再等到下载完）
                 self.q.put(("state", (snap, self._last_recs, manual, lane)))
-                if got_new:
-                    self.q.put(("avatars", None))
-
+                # 头像并行下载（最多4线程），全部完成后只做'原地刷新'，不重绘整页
+                if missing:
+                    def _dl_all(_items=dict(missing)):
+                        import concurrent.futures
+                        ok = []
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                            futs = {ex.submit(download_avatar, cid, en,
+                                             self.engine.db.version or "",
+                                             self.cfg.http_timeout): cid
+                                    for cid, en in _items.items()}
+                            for f in concurrent.futures.as_completed(futs):
+                                if f.result():
+                                    ok.append(futs[f])
+                        if ok:
+                            self.q.put(("avatar_refresh", ok))
+                    threading.Thread(target=_dl_all, daemon=True).start()
                 # ---- 全路对位总览：双方各锁定至少 3 人时才查 ----
                 self._maybe_overview(snap)
 
@@ -652,18 +718,24 @@ class CounterPickerApp:
                     snap, recs, manual, lane = payload
                     self._snap, self._last_recs = snap, recs
                     self._manual, self._lane = manual, lane
-                    self._render()
+                    # 数据签名相同则跳过重绘，避免周期性整页重建造成闪烁
+                    sig = self._state_signature()
+                    if sig != self._render_sig:
+                        self._render_sig = sig
+                        self._render()
                 elif kind == "recs_online":
                     recs, src = payload
                     self._last_recs = (recs, src)
+                    self._online_pending = False
+                    self._render_sig = None  # 数据确实变化，强制重绘一次
                     if self._snap is not None:
                         self._render()
                 elif kind == "computing":
                     if not self._last_recs[0]:
                         self.lbl_hint.configure(text="正在分析对位数据…")
-                elif kind == "avatars":
-                    if self._snap is not None:
-                        self._render()
+                elif kind == "avatar_refresh":
+                    # 新头像就绪：只更新对应头像，不销毁重建整个界面（无闪烁）
+                    self._refresh_avatars(payload)
                 elif kind == "error":
                     self.lbl_status.configure(text=f"运行异常：{payload}")
                 elif kind == "build_loading":
@@ -694,7 +766,7 @@ class CounterPickerApp:
                         self.nb.select(0)
         except queue.Empty:
             pass
-        self.root.after(200, self._drain_queue)
+        self.root.after(120, self._drain_queue)
 
     # ---------------- 符文出装 ----------------
     def _on_tab_changed(self, _evt=None):
@@ -880,8 +952,10 @@ class CounterPickerApp:
         snap = self._snap
         recs, source = self._last_recs
         ban = self._ban_mode
+        # 整页重绘：先清空头像原地刷新槽位，后续在各头像处重新登记
+        self._avatar_slots = {}
         if ban and snap:
-            target = snap.my_champ_id
+            target = snap.my_champ_id or snap.my_pick_intent_id
         else:
             target = self.engine.target_enemy(snap) if snap else 0
 
@@ -890,19 +964,23 @@ class CounterPickerApp:
         self.dot.itemconfigure(self.dot_id, fill=color)
         self.lbl_status.configure(text=phase_txt)
 
-        if snap and snap.my_champ_id:
-            info = self.engine.db.by_champion_id(snap.my_champ_id)
+        my_show = (snap.my_champ_id or snap.my_pick_intent_id) if snap else 0
+        if snap and my_show:
+            info = self.engine.db.by_champion_id(my_show)
             lane_txt = f"｜{LANE_CN.get(snap.my_lane, '')}" if snap.my_lane else ""
             self.lbl_my.configure(text=f"{info['name']}{lane_txt}",
                                   fg=TEXT)
-            my_img = self._get_photo(snap.my_champ_id, info["en"], 64)
+            my_img = self._get_photo(my_show, info["en"], 64)
             if my_img:
                 self.lbl_my_avatar.configure(
                     image=my_img, width=sp(64), height=sp(64))
                 self.lbl_my_avatar.image = my_img
             else:
                 self.lbl_my_avatar.configure(
-                    image=self._placeholder(64, CARD2), width=sp(64), height=sp(64))
+                    image=self._placeholder(64, CARD2), text="?", fg=MUTED,
+                    compound="center", width=sp(64), height=sp(64))
+            self._avatar_slots["my"] = [self.lbl_my_avatar, my_show,
+                                        info["en"], 64, CARD2]
         else:
             self.lbl_my.configure(text="等待识别…", fg=MUTED)
             self.lbl_my_avatar.configure(
@@ -930,6 +1008,8 @@ class CounterPickerApp:
                 self.lbl_badge.configure(text="● 手动选择" if self._manual else "● 自动识别",
                                          fg=GOLD if self._manual else TEAL)
             self._set_target_avatar(target, info["en"])
+            self._avatar_slots["target"] = [self.lbl_target_avatar,
+                                           target, info["en"], 64, CARD2]
         else:
             self.lbl_target_name.configure(text="—")
             self.lbl_target_sub.configure(text="进入选将或游戏后自动识别，也可手动查询",
@@ -944,8 +1024,7 @@ class CounterPickerApp:
         self._render_recs(recs, source, target)
 
         self.lbl_footer.configure(
-            text=f"更新于 {time.strftime('%H:%M:%S')}　·　数据源：{source or '—'}"
-                 f"　·　只读本地接口，不读内存不注入")
+            text=f"数据源：{source or '—'}　·　只读本地接口，不读内存不注入")
 
     def _guess_lane(self, cid: int) -> str:
         """根据英雄定位(tags)粗略猜测其分路，分路未知时兜底使用。"""
@@ -992,7 +1071,8 @@ class CounterPickerApp:
             en, cid = (info["en"], e.champion_id) if info else ("?", e.champion_id)
             box = tk.Frame(self.enemy_row, bg=CARD)
             box.pack(side="left", padx=sp(6), pady=sp(4))
-            avatar = self._avatar_label(box, cid, en, 44)
+            avatar = self._avatar_label(box, cid, en, 44,
+                                        slot_key=f"enemyrow_{cid}")
             avatar.pack()
             tk.Label(box, text=(info["name"] if info else "?")[:5], bg=CARD,
                      fg=TEXT, font=fnt(8)).pack()
@@ -1048,7 +1128,8 @@ class CounterPickerApp:
             rk.pack(side="left", padx=(sp(6), sp(2)))
 
             en = self.engine.db.en_of(c.champion_id)
-            avatar = self._avatar_label(row, c.champion_id, en, 40, bg=row_bg)
+            avatar = self._avatar_label(row, c.champion_id, en, 40, bg=row_bg,
+                                        slot_key=f"rec_{c.champion_id}")
             avatar.pack(side="left", padx=sp(6))
 
             name_box = tk.Frame(row, bg=row_bg)

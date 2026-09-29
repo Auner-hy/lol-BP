@@ -52,10 +52,11 @@ _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 @dataclass
 class ChampSelectPlayer:
     cell_id: int
-    champion_id: int          # 0 = 未选
+    champion_id: int          # 0 = 未选（已锁定的英雄）
     summoner_id: int
     position: str             # top/jungle/middle/bottom/utility/""
     is_self: bool = False
+    pick_intent_id: int = 0   # 预选(选择意向)英雄ID，未锁定时也有值；0=无预选
 
 
 @dataclass
@@ -64,6 +65,7 @@ class ChampSelectState:
     phase: str = ""                       # 如 CHAMP_SELECT / FINALIZATION
     my_position: str = ""
     my_champion_id: int = 0
+    my_pick_intent_id: int = 0   # 我方预选英雄ID（锁定前可用），0=无
     self_cell_id: int = -1
     allies: List[ChampSelectPlayer] = field(default_factory=list)
     enemies: List[ChampSelectPlayer] = field(default_factory=list)
@@ -119,7 +121,7 @@ class LCUClient:
         seen = set()
 
         def add(p):
-            """把已确定英雄的玩家加入对应队伍列表（选将会话内部的过滤辅助）。"""
+            """把目录加入枚举结果（去重，且确认其真实存在才返回）。"""
             if not p:
                 return None
             pth = Path(p)
@@ -430,12 +432,15 @@ class LCUClient:
             for p in data.get(team_key, []) or []:
                 cid = int(p.get("championId") or 0)
                 cell = int(p.get("cellId", -1))
+                # championPickIntent = 预选(选择意向)英雄，锁定前也存在
+                intent = int(p.get("championPickIntent") or 0)
                 players.append(ChampSelectPlayer(
                     cell_id=cell,
                     champion_id=cid,
                     summoner_id=int(p.get("summonerId") or 0),
                     position=str(p.get("assignedPosition") or "").lower(),
                     is_self=(cell == state.self_cell_id),
+                    pick_intent_id=intent,
                 ))
             return players
 
@@ -446,4 +451,5 @@ class LCUClient:
         if me:
             state.my_position = me.position
             state.my_champion_id = me.champion_id
+            state.my_pick_intent_id = me.pick_intent_id
         return state

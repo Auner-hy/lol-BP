@@ -48,6 +48,7 @@ class Snapshot:
     phase_cn: str = "未检测到客户端"
     my_lane: str = ""
     my_champ_id: int = 0
+    my_pick_intent_id: int = 0        # 我方预选英雄ID（未锁定时也有），0=无
     allies: List[EnemyChamp] = field(default_factory=list)     # 我方全部英雄（含自己）
     enemies: List[EnemyChamp] = field(default_factory=list)   # 敌方全部英雄
     auto_enemy_id: int = 0            # 系统判定的对位英雄（同路敌人）
@@ -106,6 +107,7 @@ class Engine:
         snap.phase_cn = "选将阶段（BP）"
         snap.my_lane = norm_lane(cs.my_position)
         snap.my_champ_id = cs.my_champion_id
+        snap.my_pick_intent_id = cs.my_pick_intent_id
         snap.bans = list(cs.banned_champion_ids)
         for p in cs.allies:
             if not p.champion_id:
