@@ -13,6 +13,18 @@
 
 ---
 
+## [1.1.1] — 2026-09-29
+
+> 主题：界面细节修复。
+
+### 修复
+
+- **底部状态栏文字被截断**：底部状态栏（更新时间 / 数据源 / 安全说明）距离
+  窗口下边缘过近，文字下半截被切掉；同时修复了状态栏控件被重复创建两次的
+  问题。现保留单个状态栏并加大下边距。
+
+---
+
 ## [1.1.0] — 2026-09-29
 
 > 主题：从"克制推荐"升级为"BP 辅助 + 符文出装"全流程工具，并改为横版双页界面。
@@ -110,6 +122,7 @@
 
 ---
 
+[1.1.1]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.1.1
 [1.1.0]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.1.0
 [1.0.1]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.0.0

@@ -282,7 +282,7 @@ class CounterPickerApp:
         self.lbl_footer = tk.Label(self.root, text="", bg=BG, fg=MUTED,
                                    font=fnt(8), anchor="w")
         self.lbl_footer.pack(side="bottom", fill="x", padx=sp(14),
-                             pady=(0, sp(6)))
+                             pady=(sp(2), sp(10)))
 
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=sp(12), pady=(0, sp(4)))
@@ -432,10 +432,6 @@ class CounterPickerApp:
         self.c_runes.pack(side="left", fill="both", expand=True, padx=(0, sp(6)))
         self.c_items.pack(side="left", fill="both", expand=True, padx=(0, sp(6)))
         self.c_skill.pack(side="left", fill="both", expand=True)
-
-        self.lbl_footer = tk.Label(self.root, text="", bg=BG, fg=MUTED,
-                                   font=fnt(8), anchor="w")
-        self.lbl_footer.pack(fill="x", padx=sp(16), pady=(0, sp(8)))
 
     def _on_rec_canvas_configure(self, e):
         self.rec_canvas.itemconfigure(self.rec_win, width=e.width - sp(6))
