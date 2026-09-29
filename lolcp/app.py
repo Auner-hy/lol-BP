@@ -22,6 +22,7 @@ import requests
 
 from .config import Config, CACHE_DIR
 from .engine import Engine, LANE_CN
+from . import teamcomp
 from . import __version__
 
 try:
@@ -168,6 +169,10 @@ class CounterPickerApp:
         self._render_sig = None       # 推荐页上一次渲染的数据签名（相同则跳过重绘）
         self._avatar_slots = {}       # 头像原地刷新槽位：slot_key -> [label,cid,en,size,bg]
         self._ban_mode = False        # 当前榜单是否为"我方英雄受克制榜"（锁定Ban推荐）
+
+        # 阵容推荐（teamcomp）
+        self._tc = None             # 最近一次 TeamCompResult（None=尚未分析）
+        self._tc_widgets = []       # 阵容推荐卡片内动态控件，重绘前统一销毁
         # 符文出装
         self._build_info = None       # 当前 BuildInfo（None=未加载）
         self._build_dirty = True      # 数据更新后、build页是否需要重渲染
@@ -356,6 +361,25 @@ class CounterPickerApp:
                                        bg=CARD, fg=MUTED, font=fnt(8), anchor="w",
                                        wraplength=sp(170), justify="left")
         self.lbl_target_sub.pack(anchor="w", pady=(sp(2), 0))
+
+        # —— 左列中部：阵容推荐（看双方整体阵容，不只看对位） ——
+        self.teamcomp_card = self._mk_card(col_l)
+        self.teamcomp_card.pack(fill="x", pady=(0, sp(6)))
+        tc_head = tk.Frame(self.teamcomp_card, bg=CARD)
+        tc_head.pack(fill="x", padx=sp(12), pady=(sp(8), sp(2)))
+        tk.Label(tc_head, text="阵 容 推 荐", bg=CARD, fg=GOLD,
+                 font=fnt(9, "bold")).pack(side="left")
+        self.lbl_tc_badge = tk.Label(tc_head, text="", bg=CARD, fg=MUTED,
+                                     font=fnt(8))
+        self.lbl_tc_badge.pack(side="right")
+        # 阵容短板/需求一句话摘要
+        self.lbl_tc_need = tk.Label(self.teamcomp_card, text="", bg=CARD, fg=TEAL,
+                                    font=fnt(8), anchor="w", justify="left",
+                                    wraplength=sp(420))
+        self.lbl_tc_need.pack(fill="x", padx=sp(12))
+        # 推荐英雄横排（由 _render_teamcomp 动态填充）
+        self.tc_row = tk.Frame(self.teamcomp_card, bg=CARD)
+        self.tc_row.pack(fill="x", padx=sp(10), pady=(sp(4), sp(8)))
 
         # —— 左列底部：敌方阵容（横向 5 头像） ——
         self.enemy_card = self._mk_card(col_l)
@@ -551,8 +575,14 @@ class CounterPickerApp:
         phase = snap.phase if snap else "none"
         my_id = (snap.my_champ_id or snap.my_pick_intent_id) if snap else 0
         lane = snap.my_lane if snap else ""
+        if self._tc is not None:
+            tc_tup = (self._tc.ready, self._tc.notice,
+                      tuple((r.champion_id, round(r.fit, 1)) for r in self._tc.recs),
+                      tuple((n.kind, round(n.strength, 2)) for n in self._tc.needs))
+        else:
+            tc_tup = None
         return (phase, ban, target, my_id, lane, allies_tup, enemies_tup,
-                bans_tup, rec_tup)
+                bans_tup, rec_tup, tc_tup)
     # ---------------- 后台线程 ----------------
     def _worker(self):
         """后台主循环（独立线程）：定时轮询客户端，产出对位推荐、符文出装、
@@ -670,8 +700,19 @@ class CounterPickerApp:
                 missing = {c: e for c, e in ens.items()
                            if not (_avatar_path(c).exists()
                                    and _avatar_path(c).stat().st_size > 1000)}
+                # ---- 阵容推荐：用双方已选英雄做整体分析（不只看对位） ----
+                ally_tc = [a.champion_id for a in snap.allies]
+                enemy_tc = [e.champion_id for e in snap.enemies]
+                tc_lane = lane or ""
+                if not tc_lane and my_id:
+                    tc_lane = self._guess_lane(my_id)
+                self._tc = teamcomp.analyze(
+                    self.engine.db, ally_tc, enemy_tc, tc_lane,
+                    my_pick_intent=(snap.my_pick_intent_id
+                                    if not snap.my_champ_id else 0))
+
                 # state 先下发：界面先用占位块即时响应（点击不再等到下载完）
-                self.q.put(("state", (snap, self._last_recs, manual, lane)))
+                self.q.put(("state", (snap, self._last_recs, manual, lane, self._tc)))
                 # 头像并行下载（最多4线程），全部完成后只做'原地刷新'，不重绘整页
                 if missing:
                     def _dl_all(_items=dict(missing)):
@@ -715,8 +756,9 @@ class CounterPickerApp:
             while True:
                 kind, payload = self.q.get_nowait()
                 if kind == "state":
-                    snap, recs, manual, lane = payload
+                    snap, recs, manual, lane, tc = payload
                     self._snap, self._last_recs = snap, recs
+                    self._tc = tc
                     self._manual, self._lane = manual, lane
                     # 数据签名相同则跳过重绘，避免周期性整页重建造成闪烁
                     sig = self._state_signature()
@@ -1020,6 +1062,7 @@ class CounterPickerApp:
                 compound="center", font=fnt(14, "bold"),
                 width=sp(64), height=sp(64))
 
+        self._render_teamcomp()
         self._render_enemies(snap, target)
         self._render_recs(recs, source, target)
 
@@ -1054,6 +1097,48 @@ class CounterPickerApp:
                 image=self._placeholder(64, CARD2), text="?", fg=MUTED,
                 compound="center", font=fnt(14, "bold"),
                 width=sp(64), height=sp(64))
+
+    def _render_teamcomp(self):
+        """渲染阵容推荐卡：先给一句"阵容缺什么"，再横排契合度最高的英雄。"""
+        for w in self._tc_widgets:
+            w.destroy()
+        self._tc_widgets = []
+        tc = self._tc
+        if tc is None:
+            self.lbl_tc_badge.configure(text="")
+            self.lbl_tc_need.configure(text="", fg=MUTED)
+            return
+
+        if not tc.ready:
+            # 人数还不够：只提示，不占推荐位
+            self.lbl_tc_badge.configure(text="等待选人")
+            self.lbl_tc_need.configure(text=tc.notice, fg=MUTED)
+            return
+
+        self.lbl_tc_badge.configure(text="看整体阵容")
+        if tc.needs:
+            # 取最强的两条需求拼成一句话
+            top_msgs = [n.message for n in tc.needs[:2]]
+            self.lbl_tc_need.configure(text="；".join(top_msgs), fg=TEAL)
+        else:
+            self.lbl_tc_need.configure(text=tc.notice, fg=GREEN)
+
+        # 横排前 5 个推荐英雄：头像 + 契合分
+        for rec in tc.recs[:5]:
+            info = self.engine.db.by_champion_id(rec.champion_id)
+            en = info["en"] if info else "?"
+            box = tk.Frame(self.tc_row, bg=CARD)
+            box.pack(side="left", padx=sp(5), pady=sp(2))
+            avatar = self._avatar_label(
+                box, rec.champion_id, en, 42,
+                slot_key=f"teamcomp_{rec.champion_id}")
+            avatar.pack()
+            tk.Label(box, text=(info["name"] if info else "?")[:5], bg=CARD,
+                     fg=TEXT, font=fnt(8)).pack()
+            fit_col = GREEN if rec.fit >= 80 else (TEAL if rec.fit >= 60 else GOLD_DIM)
+            tk.Label(box, text=f"契合{rec.fit:.0f}", bg=CARD, fg=fit_col,
+                     font=fnt(7, "bold")).pack()
+            self._tc_widgets.extend([box, avatar] + box.winfo_children())
 
     def _render_enemies(self, snap, target):
         """渲染敌方已锁定英雄一排头像；点击任一头像可手动把 TA 设为对位目标。"""

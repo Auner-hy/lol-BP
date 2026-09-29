@@ -84,6 +84,27 @@ COMMON_ALIASES: Dict[int, str] = {
 }
 
 
+def _pick_stats(raw: dict) -> dict:
+    """从官方 stats 中提取阵容分析需要的基础属性（1 级数值 + 每级成长）。
+
+    hp=基础生命, armor=护甲, spellblock=魔抗, attackrange=攻击距离,
+    attackdamage=攻击力, movespeed=移速。
+    """
+    def g(k):
+        try:
+            return float(raw.get(k, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return {
+        "hp": g("hp"), "hp_per_level": g("hpperlevel"),
+        "armor": g("armor"), "armor_per_level": g("armorperlevel"),
+        "spellblock": g("spellblock"), "spellblock_per_level": g("spellblockperlevel"),
+        "attackrange": g("attackrange"),
+        "attackdamage": g("attackdamage"),
+        "movespeed": g("movespeed"),
+    }
+
+
 def _slug(name: str) -> str:
     """英雄英文名 -> 各网站使用的 URL slug。"""
     s = name.replace("Wukong", "MonkeyKing")  # 部分站点用 MonkeyKing
@@ -180,13 +201,16 @@ class ChampionDB:
                     "alias": cn_alias if cn_alias != cn_name else "",
                     "tags": info.get("tags", []),
                     "slug": _slug(key),
+                    # 官方基础属性（阵容分析用于判断身板硬度 / 近战远程）
+                    "stats": _pick_stats(info.get("stats", {})),
                 }
                 self.en_name_to_id[key.lower().replace(" ", "").replace("'", "").replace(".", "")] = cid
         # 内置兜底，保证离线也能识别常见英雄
         for cid, en in FALLBACK_ID_TO_NAME.items():
             if cid not in self.by_id:
                 self.by_id[cid] = {"id": cid, "en": en, "name": en, "title": en,
-                                   "alias": "", "tags": [], "slug": _slug(en)}
+                                   "alias": "", "tags": [], "slug": _slug(en),
+                                   "stats": {}}
         # 玩家常用俗称（社区叫法），纳入搜索与匹配
         for cid, alias in COMMON_ALIASES.items():
             if cid in self.by_id:
