@@ -17,6 +17,7 @@ from .engine import Engine, LANE_CN
 
 
 def _print_recs(enemy_id: int, lane: str, engine: Engine):
+    """在命令行打印对指定敌方英雄的克制推荐列表（无界面时的备用展示）。"""
     ename = engine.db.name_of(enemy_id)
     recs, source = engine.recommend(enemy_id, lane)
     print(f"\n对位英雄：{ename}（分路：{LANE_CN.get(lane, lane or '自动')}）  数据源：{source or '无'}")
@@ -30,6 +31,7 @@ def _print_recs(enemy_id: int, lane: str, engine: Engine):
 
 
 def run_cli(cfg: Config):
+    """命令行交互模式：列出敌方英雄，选择对位后打印克制推荐。"""
     engine = Engine(cfg)
     print("LOL 对位 Counter 推荐（命令行模式）")
     print("检测中… 进入选将阶段或游戏后自动刷新。Ctrl+C 退出。\n")
@@ -55,6 +57,7 @@ def run_cli(cfg: Config):
 
 
 def run_test(cfg: Config):
+    """自检模式：依次测试英雄库加载、LCU 与 live 客户端连接并打印结果。"""
     engine = Engine(cfg)
     print("== 自测模式：不需要游戏客户端 ==")
     for eid, lane in [(266, "top"), (84, "middle"), (238, "middle"),
@@ -64,6 +67,7 @@ def run_test(cfg: Config):
 
 
 def run_query(cfg: Config, enemy_en: str, lane: str):
+    """单英雄查询模式：直接查询并打印指定英雄的克制推荐。"""
     engine = Engine(cfg)
     cid = engine.db.id_by_en(enemy_en)
     if not cid:
@@ -73,6 +77,7 @@ def run_query(cfg: Config, enemy_en: str, lane: str):
 
 
 def main():
+    """程序命令行入口：解析参数并分发到 GUI / CLI / 自检 / 单查询模式。"""
     ap = argparse.ArgumentParser(description="LOL 对位识别与 Counter 推荐")
     ap.add_argument("--cli", action="store_true", help="命令行模式（无 GUI）")
     ap.add_argument("--gui", action="store_true", help="桌面悬浮窗模式（默认）")

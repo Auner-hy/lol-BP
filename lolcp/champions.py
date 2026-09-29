@@ -96,6 +96,7 @@ class ChampionDB:
     """英雄数据库：数字 ID、英文名、中文名、URL slug 互转。"""
 
     def __init__(self, lang: str = "zh_CN", timeout: float = 12.0):
+        """初始化英雄库（语言、请求超时、本地缓存目录）。"""
         self.lang = lang
         self.timeout = timeout
         self.version: Optional[str] = None
@@ -104,6 +105,7 @@ class ChampionDB:
         self._loaded = False
 
     def load(self) -> None:
+        """加载英雄数据：缓存优先（毫秒级），仅首次无缓存才联网；可重复调用。"""
         if self._loaded:
             return
         cache = CACHE_DIR / f"champions_{self.lang}.json"
@@ -144,6 +146,7 @@ class ChampionDB:
         import threading
 
         def _work():
+            """后台线程实际执行：检查线上最新版本，有更新则写入缓存（下次启动生效）。"""
             try:
                 cache = CACHE_DIR / f"champions_{self.lang}.json"
                 versions = requests.get(DDRAGON_VERSIONS, timeout=self.timeout).json()
@@ -162,6 +165,7 @@ class ChampionDB:
         threading.Thread(target=_work, daemon=True).start()
 
     def _fill(self, data) -> None:
+        """根据英雄数据填充各查询索引，并补充内置兜底映射与常用别名。"""
         if data:
             for key, info in data.items():
                 cid = int(info["key"])
@@ -191,27 +195,33 @@ class ChampionDB:
                 self.by_id[cid]["alias"] = merged.strip()
 
     def display_name(self, cid: int) -> str:
+        """返回英雄展示名（中文名，未知时回退英文名或占位符）。"""
         info = self.by_champion_id(cid)
         return info["name"] if info else f"英雄#{cid}"
 
     # ---- 查询方法 ----
     def by_champion_id(self, cid: int) -> Optional[dict]:
+        """按数字 ID 查询英雄完整信息。"""
         self.load()
         return self.by_id.get(int(cid))
 
     def name_of(self, cid: int) -> str:
+        """按数字 ID 返回中文名。"""
         info = self.by_champion_id(cid)
         return info["name"] if info else f"英雄#{cid}"
 
     def en_of(self, cid: int) -> str:
+        """按数字 ID 返回英文名。"""
         info = self.by_champion_id(cid)
         return info["en"] if info else f"Champ{cid}"
 
     def slug_of_id(self, cid: int) -> str:
+        """按数字 ID 返回供在线接口使用的英文短名(slug)。"""
         info = self.by_champion_id(cid)
         return info["slug"] if info else str(cid)
 
     def id_by_en(self, en_name: str) -> Optional[int]:
+        """按英文名（大小写、空格不敏感）反查数字 ID。"""
         self.load()
         key = en_name.lower().replace(" ", "").replace("'", "").replace(".", "").replace("&", "")
         # 站点/旧名称差异
@@ -232,5 +242,6 @@ class ChampionDB:
         return None
 
     def all_ids(self) -> list[int]:
+        """返回全部英雄的数字 ID 列表。"""
         self.load()
         return sorted(self.by_id.keys())

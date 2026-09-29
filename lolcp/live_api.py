@@ -53,9 +53,11 @@ class LiveGame:
     players: List[LivePlayer] = field(default_factory=list)
 
     def enemies(self) -> List[LivePlayer]:
+        """属性：返回敌方五名玩家。"""
         return [p for p in self.players if p.team != self.my_team]
 
     def enemy_in_my_lane(self) -> Optional[LivePlayer]:
+        """属性：返回与我同一路的敌方玩家（对位目标）。"""
         if not self.my_position:
             return None
         for p in self.enemies():
@@ -66,11 +68,13 @@ class LiveGame:
 
 class LiveClient:
     def __init__(self, timeout: float = 4.0):
+        """初始化 live 客户端实时数据访问对象。"""
         self.timeout = timeout
         self._s = requests.Session()
         self._s.verify = False
 
     def is_live(self) -> bool:
+        """判断当前是否处于游戏进行中（live client 能否取到数据）。"""
         try:
             r = self._s.get(f"{LIVE_BASE}/gamestats", timeout=self.timeout)
             return r.status_code == 200
@@ -78,6 +82,7 @@ class LiveClient:
             return False
 
     def all_game_data(self) -> Optional[LiveGame]:
+        """拉取 live client 的全部实时对局数据。"""
         try:
             r = self._s.get(f"{LIVE_BASE}/allgamedata", timeout=self.timeout)
             r.raise_for_status()

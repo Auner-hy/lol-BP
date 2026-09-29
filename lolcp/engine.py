@@ -58,6 +58,7 @@ class Snapshot:
 
 class Engine:
     def __init__(self, config: Config):
+        """初始化引擎及其数据源（LCU、live 客户端、英雄库与推荐器）。"""
         self.cfg = config
         self.db = ChampionDB(lang=config.language, timeout=config.http_timeout)
         self.lcu = LCUClient(client_path=config.client_path, timeout=5.0)
@@ -69,6 +70,7 @@ class Engine:
 
     # ---------- 本地状态轮询（无外网） ----------
     def poll(self) -> Snapshot:
+        """轮询当前状态并生成统一快照（选将阶段 / 游戏内 / 未开始）。"""
         snap = Snapshot(updated_at=time.time())
         self.db.load()
 
@@ -99,6 +101,7 @@ class Engine:
         return snap
 
     def _snapshot_from_champ_select(self, snap: Snapshot, cs) -> Snapshot:
+        """选将阶段：从 LCU 数据填充快照（双方英雄、分路、禁用与阶段）。"""
         snap.phase = "champ_select"
         snap.phase_cn = "选将阶段（BP）"
         snap.my_lane = norm_lane(cs.my_position)
@@ -129,6 +132,7 @@ class Engine:
         return snap
 
     def _snapshot_from_game(self, snap: Snapshot, game) -> Snapshot:
+        """游戏内：从 live 客户端实时数据填充快照。"""
         snap.phase = "in_game"
         snap.phase_cn = "游戏进行中"
         snap.mode = game.mode
@@ -185,9 +189,11 @@ class Engine:
         return out
 
     def target_enemy(self, snap: Snapshot) -> int:
+        """确定当前对位目标（手动选择优先，否则取与我同路的敌方）。"""
         return self.manual_enemy_id or snap.auto_enemy_id
 
     def recommend(self, enemy_id: int, lane: str) -> Tuple[List[Counter], str]:
+        """获取对指定敌方英雄、指定分路的克制推荐。"""
         if not enemy_id:
             return [], ""
         # 游戏内/选将同路对位时用玩家分路；盲选查不到分路时按敌方常见分路兜底
@@ -195,6 +201,7 @@ class Engine:
         return self.recommender.recommend(enemy_id, query_lane)
 
     def _guess_lane(self, champion_id: int) -> str:
+        """分路未知时，根据英雄定位(tags)粗略猜测其分路。"""
         info = self.db.by_champion_id(champion_id)
         if not info:
             return "top"

@@ -216,6 +216,7 @@ class CounterPickerApp:
 
     # ---------------- 主题 ----------------
     def _setup_style(self):
+        """配置 ttk 全局控件样式（主题、滚动条、下拉框配色）。"""
         st = ttk.Style()
         try:
             st.theme_use("clam")
@@ -240,6 +241,7 @@ class CounterPickerApp:
 
     # ---------------- UI 构建 ----------------
     def _build_ui(self):
+        """搭建整个窗口：顶部状态栏、双标签页（推荐页 / 符文出装页）及底部状态栏。"""
         # ===== 顶部标题栏 =====
         header = tk.Frame(self.root, bg=BG)
         header.pack(fill="x", padx=sp(14), pady=(sp(10), sp(4)))
@@ -436,13 +438,16 @@ class CounterPickerApp:
         self.c_skill.pack(side="left", fill="both", expand=True)
 
     def _on_rec_canvas_configure(self, e):
+        """推荐列表宽度随窗口缩放时，同步调整内部画布可视宽度。"""
         self.rec_canvas.itemconfigure(self.rec_win, width=e.width - sp(6))
 
     def _mk_card(self, parent) -> tk.Frame:
+        """创建一个统一样式的卡片容器（深色底 + 细边框）。"""
         return tk.Frame(parent, bg=CARD, highlightbackground=BORDER,
                         highlightthickness=sp(1))
 
     def _mk_button(self, parent, text, cmd, color) -> tk.Label:
+        """用 Label 手搓一个可点击按钮（含鼠标悬停高亮效果）。"""
         lbl = tk.Label(parent, text=text, bg=CARD2, fg=color, font=fnt(9, "bold"),
                        padx=sp(12), pady=sp(5), cursor="hand2",
                        highlightbackground=BORDER, highlightthickness=sp(1))
@@ -453,6 +458,7 @@ class CounterPickerApp:
 
     # ---------------- 头像 ----------------
     def _placeholder(self, size: int, color: str) -> tk.PhotoImage:
+        """生成纯色占位方块（头像/图标尚未加载时使用），并按尺寸缓存。"""
         key = ("_ph", size, color)
         if key not in self.photos:
             img = tk.PhotoImage(width=sp(size), height=sp(size))
@@ -485,6 +491,7 @@ class CounterPickerApp:
         return None
 
     def _avatar_label(self, parent, cid: int, en: str, size: int, bg=CARD2) -> tk.Label:
+        """创建英雄头像标签；无头像时显示带问号的占位块。"""
         lbl = tk.Label(parent, bg=bg)
         img = self._get_photo(cid, en, size)
         if img:
@@ -497,6 +504,8 @@ class CounterPickerApp:
 
     # ---------------- 后台线程 ----------------
     def _worker(self):
+        """后台主循环（独立线程）：定时轮询客户端，产出对位推荐、符文出装、
+        头像下载、全路总览与自动翻页等任务，并把 UI 更新消息放入队列。"""
         while not self.stop_ev.is_set():
             try:
                 snap = self.engine.poll()
@@ -635,6 +644,7 @@ class CounterPickerApp:
             self.wake.clear()
 
     def _drain_queue(self):
+        """主线程定时消费后台线程放入队列的消息，驱动界面刷新（tkinter 只能在主线程更新）。"""
         try:
             while True:
                 kind, payload = self.q.get_nowait()
@@ -688,16 +698,19 @@ class CounterPickerApp:
 
     # ---------------- 符文出装 ----------------
     def _on_tab_changed(self, _evt=None):
+        """标签页切换事件：切到符文出装页且有新数据时重渲染。"""
         # 切到符文出装页且数据是新的，就重渲染整页
         if self.nb.index("current") == 1 and self._build_info \
                 and self._build_dirty:
             self._render_build()
 
     def _switch_to_build_tab(self):
+        """切换到第二个标签页（符文出装）。"""
         if self.nb.index("current") != 1:
             self.nb.select(1)
 
     def _reset_build_placeholder(self):
+        """清空符文出装页并恢复“尚未确定英雄”的占位状态。"""
         for col in (self.c_runes, self.c_items, self.c_skill):
             for w in col.winfo_children():
                 w.destroy()
@@ -750,6 +763,7 @@ class CounterPickerApp:
         return None
 
     def _render_build(self):
+        """把当前 BuildInfo 渲染到符文出装页：三列布局（符文 / 出装 / 召唤师技能与加点）。"""
         b = self._build_info
         if not b:
             return
@@ -862,6 +876,7 @@ class CounterPickerApp:
 
     # ---------------- 渲染（原） ----------------
     def _render(self):
+        """渲染推荐页整体：阶段状态、我方与对位目标、敌方英雄、推荐列表和底部状态栏。"""
         snap = self._snap
         recs, source = self._last_recs
         ban = self._ban_mode
@@ -933,6 +948,7 @@ class CounterPickerApp:
                  f"　·　只读本地接口，不读内存不注入")
 
     def _guess_lane(self, cid: int) -> str:
+        """根据英雄定位(tags)粗略猜测其分路，分路未知时兜底使用。"""
         info = self.engine.db.by_champion_id(cid)
         if not info:
             return ""
@@ -948,6 +964,7 @@ class CounterPickerApp:
         return "middle"
 
     def _set_target_avatar(self, cid: int, en: str):
+        """设置对位目标的头像；尚未下载时显示问号占位。"""
         img = self._get_photo(cid, en, 64)
         if img:
             self.lbl_target_avatar.configure(image=img, text="",
@@ -960,6 +977,7 @@ class CounterPickerApp:
                 width=sp(64), height=sp(64))
 
     def _render_enemies(self, snap, target):
+        """渲染敌方已锁定英雄一排头像；点击任一头像可手动把 TA 设为对位目标。"""
         for w in self._enemy_widgets:
             w.destroy()
         self._enemy_widgets = []
@@ -990,6 +1008,7 @@ class CounterPickerApp:
             self._enemy_widgets.extend([box, avatar] + box.winfo_children())
 
     def _render_recs(self, recs, source, target):
+        """渲染克制推荐 / 受克制榜列表：排名、头像、胜率与克制强度进度条。"""
         for w in self._row_widgets:
             w.destroy()
         self._row_widgets = []
@@ -1141,6 +1160,7 @@ class CounterPickerApp:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_ov_row(self, row):
+        """接收某一路对位的查询结果并刷新全路总览。"""
         ln, aid, eid, wr, src = row
         self._ov_data[ln] = (aid, eid, wr, src)
         self._render_overview()
@@ -1203,6 +1223,7 @@ class CounterPickerApp:
 
     # ---------------- 交互 ----------------
     def _select_manual(self, cid: int, lane: str):
+        """手动把某个英雄选为对位目标，并立即唤醒后台线程重查。"""
         self.engine.manual_enemy_id = int(cid)
         self.engine.manual_lane = lane if lane in LANE_CN else ""
         self._rec_key = None
@@ -1218,6 +1239,7 @@ class CounterPickerApp:
         self.wake.set()
 
     def _clear_manual(self):
+        """取消手动选择，恢复自动识别。"""
         self.engine.manual_enemy_id = 0
         self.engine.manual_lane = ""
         self._rec_key = None
@@ -1229,6 +1251,7 @@ class CounterPickerApp:
         self.wake.set()
 
     def _toggle_top(self):
+        """切换窗口是否始终置顶。"""
         try:
             self.root.attributes("-topmost", self.var_top.get())
         except tk.TclError:
@@ -1252,6 +1275,7 @@ class CounterPickerApp:
                         ("中单", "middle"), ("下路", "bottom"), ("辅助", "support")]
 
     def _build_search_bar(self, parent):
+        """构建手动查询栏：英雄搜索下拉框（支持中英文名/俗称）+ 分路选择 + 查询按钮。"""
         card = self._mk_card(parent)
         card.pack(fill="x", padx=sp(4), pady=(sp(2), sp(6)))
 
@@ -1286,6 +1310,7 @@ class CounterPickerApp:
             side="left", padx=(sp(8), 0))
 
     def _filter_champs(self, _evt=None):
+        """根据搜索框已输入内容，实时过滤下拉候选英雄列表。"""
         q = self.var_search.get().strip().lower()
         if not q:
             self.combo_search["values"] = self._champ_names
@@ -1302,6 +1327,7 @@ class CounterPickerApp:
                 n for n in self._champ_names if q in n.lower()][:13]
 
     def _do_search(self):
+        """执行查询：解析输入的英雄并设为手动对位目标；找不到则弹窗提示。"""
         cid = self._find_champ(self.var_search.get())
         if not cid:
             messagebox.showwarning("未找到",
@@ -1312,6 +1338,7 @@ class CounterPickerApp:
         self._select_manual(cid, lane)
 
     def _find_champ(self, text: str):
+        """把用户输入（中英文名/称号/俗称，可带｜分隔）解析为英雄 ID；支持模糊打分匹配。"""
         raw = text.strip()
         if not raw:
             return None
@@ -1356,9 +1383,11 @@ class CounterPickerApp:
         return best
 
     def _on_close(self):
+        """关闭窗口：通知后台线程退出并销毁界面。"""
         self.stop_ev.set()
         self.wake.set()
         self.root.after(200, self.root.destroy)
 
     def run(self):
+        """进入 Tkinter 主事件循环（阻塞，直到窗口关闭）。"""
         self.root.mainloop()

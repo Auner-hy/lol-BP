@@ -53,6 +53,7 @@ class Config:
 
     @classmethod
     def load(cls) -> "Config":
+        """读取本地配置文件；文件不存在或损坏时返回一份默认配置。"""
         cfg = cls()
         if CONFIG_PATH.exists():
             try:
@@ -65,6 +66,7 @@ class Config:
         return cfg
 
     def save(self) -> None:
+        """把当前配置写回本地 JSON 文件。"""
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(
             json.dumps(asdict(self), ensure_ascii=False, indent=2), encoding="utf-8"

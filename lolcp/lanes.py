@@ -79,6 +79,7 @@ CHAMPION_LANES: dict[str, Set[str]] = {
 
 
 def _normalize(en: str) -> str:
+    """规范化分路字符串（转小写、去空格），便于比较。"""
     s = en.replace(" ", "").replace("'", "").replace(".", "").replace("&", "")
     s = s.replace("Wukong", "MonkeyKing")
     if s == "BelVeth":

@@ -70,6 +70,7 @@ class ChampSelectState:
     banned_champion_ids: List[int] = field(default_factory=list)
 
     def locked_enemies(self) -> List[ChampSelectPlayer]:
+        """属性：返回敌方队伍中已锁定英雄的玩家列表。"""
         return [p for p in self.enemies if p.champion_id and p.champion_id > 0]
 
     def enemy_in_my_lane(self) -> Optional[ChampSelectPlayer]:
@@ -86,6 +87,7 @@ class LCUClient:
     """英雄联盟客户端本地接口客户端。"""
 
     def __init__(self, client_path: str = "", timeout: float = 5.0):
+        """初始化选将会话，并立即拉取双方队伍数据。"""
         self.client_path = client_path
         self.timeout = timeout
         self.port: Optional[int] = None
@@ -117,6 +119,7 @@ class LCUClient:
         seen = set()
 
         def add(p):
+            """把已确定英雄的玩家加入对应队伍列表（选将会话内部的过滤辅助）。"""
             if not p:
                 return None
             pth = Path(p)
@@ -183,6 +186,7 @@ class LCUClient:
 
     @staticmethod
     def _find_client_dir_via_process() -> Optional[Path]:
+        """通过 League 进程命令行参数定位客户端安装目录（--install-directory）。"""
         if not sys.platform.startswith("win"):
             return None
         # 优先 Get-Process（不依赖 WMI/CIM 服务；部分机器 WMI 损坏会报"无效类"）
@@ -236,6 +240,7 @@ class LCUClient:
         """netstat + tasklist：当前 LeagueClient.exe 监听的 127.0.0.1 端口。
         不需要管理员权限，反作弊不影响 netstat。"""
         def _run(cmd):
+            """执行一条命令并返回其标准输出文本（失败时返回空字符串）。"""
             try:
                 out = subprocess.run(
                     cmd, capture_output=True, timeout=10,
@@ -361,6 +366,7 @@ class LCUClient:
         return False
 
     def is_connected(self) -> bool:
+        """判断当前 LCU 连接是否仍然有效。"""
         if not self._session:
             return False
         try:
@@ -370,11 +376,13 @@ class LCUClient:
             return False
 
     def ensure_connected(self) -> bool:
+        """确保已连接 LCU；尚未连接或连接失效时自动重连。"""
         if self.is_connected():
             return True
         return self.connect()
 
     def _get(self, path: str, **kwargs):
+        """向 LCU 发送 HTTPS GET 请求（自动携带本地鉴权信息）。"""
         if not self._session:
             raise RuntimeError("LCU 未连接")
         url = f"{self.protocol}://127.0.0.1:{self.port}{path}"
@@ -384,6 +392,7 @@ class LCUClient:
 
     # ---------- 业务数据 ----------
     def current_summoner(self) -> Optional[dict]:
+        """获取当前登录召唤师的基础信息。"""
         try:
             return self._get("/lol-summoner/v1/current-summoner")
         except Exception:
@@ -416,6 +425,7 @@ class LCUClient:
         state.banned_champion_ids = bans
 
         def parse_team(team_key: str) -> List[ChampSelectPlayer]:
+            """从选将数据中解析指定队伍（己方/敌方）的玩家列表。"""
             players = []
             for p in data.get(team_key, []) or []:
                 cid = int(p.get("championId") or 0)

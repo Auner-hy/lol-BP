@@ -32,6 +32,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 
 def _make_session() -> requests.Session:
+    """创建带浏览器标识(User-Agent)的 requests 会话。"""
     s = requests.Session()
     s.headers.update({"User-Agent": UA})
     return s
@@ -43,6 +44,7 @@ _SESSIONS: dict[str, requests.Session] = {}
 
 
 def _session(name: str) -> requests.Session:
+    """按数据源名获取（或新建）带专用请求头的会话，含来源页伪装。"""
     s = _SESSIONS.get(name)
     if s is None:
         s = _make_session()
@@ -74,10 +76,12 @@ CACHE_VERSION = "v3"
 
 # ---------------- 缓存 ----------------
 def _cache_path(provider: str, enemy_slug: str, lane: str, tier: str) -> Path:
+    """生成某数据源/英雄/分路/段位对应的本地缓存文件路径。"""
     return CACHE_DIR / f"{provider}_{CACHE_VERSION}_{enemy_slug}_{lane}_{tier}.json"
 
 
 def _cache_read(provider: str, enemy_slug: str, lane: str, tier: str) -> Optional[list]:
+    """读取仍在有效期内的本地对位数据缓存，过期或缺失返回 None。"""
     p = _cache_path(provider, enemy_slug, lane, tier)
     if p.exists():
         try:
@@ -91,6 +95,7 @@ def _cache_read(provider: str, enemy_slug: str, lane: str, tier: str) -> Optiona
 
 def _cache_write(provider: str, enemy_slug: str, lane: str, tier: str,
                  counters: list) -> None:
+    """把对位数据写入本地缓存（附带写入时间戳）。"""
     try:
         _cache_path(provider, enemy_slug, lane, tier).write_text(
             json.dumps({"ts": time.time(), "counters": counters}, ensure_ascii=False),
@@ -165,6 +170,7 @@ def fetch_lolalytics(enemy_slug: str, lane: str, timeout: float = 12.0,
 # ---------------- Provider: Blitz (best effort) ----------------
 def fetch_blitz(enemy_slug: str, lane: str, timeout: float = 12.0,
                 tier: str = "emerald_plus") -> Optional[List[dict]]:
+    """从 Blitz.gg 拉取指定英雄分路的对位原始数据。"""
     # tier 仅用于缓存分桶（Blitz 页面不分段位），不参与请求 URL
     url = f"https://blitz.gg/lol/champions/{enemy_slug}/counters?role={lane.upper()}"
     try:
@@ -185,6 +191,7 @@ def fetch_blitz(enemy_slug: str, lane: str, timeout: float = 12.0,
     found: list[dict] = []
 
     def walk(node):
+        """递归遍历 Blitz 返回的 JSON，命中对位结构时收集记录。"""
         if isinstance(node, dict):
             # 常见字段：matchups / counters，内含 championName + winRate
             cname = node.get("championName") or node.get("name")
@@ -211,6 +218,7 @@ def fetch_blitz(enemy_slug: str, lane: str, timeout: float = 12.0,
 
 # ---------------- Provider: 离线表 ----------------
 def fetch_offline(enemy_en: str, lane: str) -> Optional[List[dict]]:
+    """从内置离线克制表查询对位数据（无网络时的兜底）。"""
     table = OFFLINE_COUNTERS.get(lane or "top", {})
     rows = table.get(enemy_en)
     if not rows:
@@ -309,6 +317,7 @@ def _ensure_perk_map() -> None:
 
 
 def _perk_url(perk_id: int) -> str:
+    """由符文 ID 生成 Data Dragon 官方符文图标 URL。"""
     _ensure_perk_map()
     return _PERK_ICON_URLS.get(int(perk_id), "")
 
@@ -335,6 +344,7 @@ def _ensure_summoner_map() -> None:
 
 
 def _summoner_url(spell_id) -> str:
+    """由召唤师技能 ID 或名称生成图标 URL（含本地内置映射兜底）。"""
     _ensure_summoner_map()
     name = _SUMMONER_ICON.get(str(spell_id))
     if not name:
@@ -513,6 +523,7 @@ class Recommender:
     # ---------- 通用符文 / 出装 ----------
     @staticmethod
     def _build_to_dict(b: BuildInfo) -> dict:
+        """把 BuildInfo 序列化为可写入缓存的字典。"""
         return {k: getattr(b, k) for k in [
             "champion_id", "lane", "patch", "keystone_id", "keystone_url",
             "runes", "shards", "summoner", "start_items", "core_items",
@@ -520,6 +531,7 @@ class Recommender:
 
     @staticmethod
     def _build_from_dict(d: dict) -> BuildInfo:
+        """把缓存字典反序列化回 BuildInfo（兼容旧版缓存格式）。"""
         data = {k: d.get(k) for k in [
             "champion_id", "lane", "patch", "keystone_id", "keystone_url",
             "runes", "shards", "summoner", "start_items", "core_items",
@@ -563,6 +575,7 @@ class Recommender:
         result = {}
 
         def cb(recs, src):
+            """在线推荐返回后的回调：写入缓存并转换为 Counter 列表。"""
             result["recs"], result["src"] = recs, src
 
         t = self.recommend_async(enemy_id, lane, on_online=cb, quick_timeout=None)
@@ -585,6 +598,7 @@ class Recommender:
         tier = self.tier
 
         def work():
+            """recommend_async 后台线程的主执行逻辑。"""
             info = self.db.by_champion_id(enemy_id)
             if not info:
                 return
@@ -594,6 +608,7 @@ class Recommender:
             box: dict = {}
 
             def try_lola():
+                """后台尝试用 Lolalytics 获取对位数据，成功则回调更新。"""
                 try:
                     cached = _cache_read("lola", slug, ql, tier)
                     if cached is not None:
@@ -607,6 +622,7 @@ class Recommender:
                     pass
 
             def try_blitz():
+                """后台尝试用 Blitz 获取对位数据，成功则回调更新。"""
                 try:
                     cached = _cache_read("blitz", slug, ql, tier)
                     if cached is not None:
@@ -645,6 +661,7 @@ class Recommender:
         return t
 
     def _build_counters(self, enemy_id: int, lane: str, rows: list, source: str) -> List[Counter]:
+        """把原始对位行转换为 Counter 列表，并按克制幅度排序。"""
         counters: List[Counter] = []
         for row in rows:
             name = htmllib.unescape(str(row["enemy_name"])).strip()
