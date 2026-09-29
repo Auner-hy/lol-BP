@@ -43,8 +43,20 @@ TEXT     = "#E8E6E3"
 MUTED    = "#7A8299"
 FONT     = "Microsoft YaHei UI"
 
+# 段位下拉：(显示名, lolalytics tier参数)，全部实测有效
+TIER_OPTS = [
+    ("黄金及以上", "gold_plus"),
+    ("白金及以上", "platinum_plus"),
+    ("翡翠及以上", "emerald_plus"),
+    ("钻石及以上", "diamond_plus"),
+    ("大师及以上", "master_plus"),
+]
+
 AVATAR_DIR = CACHE_DIR / "avatars"
 AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+# 符文/装备/技能等小图标缓存（按 URL 哈希命名）
+ICON_DIR = CACHE_DIR / "icons"
+ICON_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------- 高 DPI 全局缩放 ----------
 SCALE = 1.0
@@ -125,6 +137,15 @@ def download_avatar(cid: int, en: str, version: str, timeout: float = 8.0) -> Pa
 
 
 class CounterPickerApp:
+    # 段位下拉：(显示名, lolalytics tier参数)，全部实测有效
+    TIER_OPTS = [
+        ("黄金及以上", "gold_plus"),
+        ("白金及以上", "platinum_plus"),
+        ("翡翠及以上", "emerald_plus"),
+        ("钻石及以上", "diamond_plus"),
+        ("大师及以上", "master_plus"),
+    ]
+
     def __init__(self, cfg: Config):
         global SCALE
         SCALE = _init_dpi()
@@ -143,6 +164,17 @@ class CounterPickerApp:
         self._manual = False
         self._lane = ""
         self._online_pending = False  # 本轮是否正在等待在线数据（用于头像延后）
+        self._ban_mode = False        # 当前榜单是否为"我方英雄受克制榜"（锁定Ban推荐）
+        # 符文出装
+        self._build_info = None       # 当前 BuildInfo（None=未加载）
+        self._build_dirty = True      # 数据更新后、build页是否需要重渲染
+        self._build_cid = 0           # 当前 build 对应的英雄ID
+        self._build_key = None        # 已加载 build 的 (英雄ID,分路)
+        self._build_imgs = {}         # build 图标缓存 key -> PhotoImage
+        self._auto_switched = False   # 本局是否已自动跳转到符文出装页
+        # 全路总览：阵容指纹 -> {lane: (ally_id, enemy_id, ally_winrate, src)}
+        self._ov_fp = None
+        self._ov_data: dict[str, tuple] = {}
         self._row_widgets: list[tk.Widget] = []
         self._enemy_widgets: list[tk.Widget] = []
 
@@ -157,8 +189,8 @@ class CounterPickerApp:
 
         self.root.title("LOL 对位 Counter 助手")
         self.root.configure(bg=BG)
-        self.root.geometry(f"{sp(440)}x{sp(860)}")
-        self.root.minsize(sp(420), sp(760))
+        self.root.geometry(f"{sp(1000)}x{sp(640)}")
+        self.root.minsize(sp(860), sp(560))
         try:
             self.root.attributes("-topmost", True)
         except tk.TclError:
@@ -166,6 +198,13 @@ class CounterPickerApp:
 
         self._setup_style()
         self._build_ui()
+        # 段位下拉初值：与配置一致
+        for i, (_, t) in enumerate(self.TIER_OPTS):
+            if t == self.cfg.tier:
+                self.combo_tier.current(i)
+                break
+        else:
+            self.combo_tier.current(2)
 
         self.t = threading.Thread(target=self._worker, daemon=True)
         self.t.start()
@@ -198,9 +237,9 @@ class CounterPickerApp:
 
     # ---------------- UI 构建 ----------------
     def _build_ui(self):
-        # 顶部标题栏
+        # ===== 顶部标题栏 =====
         header = tk.Frame(self.root, bg=BG)
-        header.pack(fill="x", padx=sp(14), pady=(sp(12), sp(6)))
+        header.pack(fill="x", padx=sp(14), pady=(sp(10), sp(4)))
         self.dot = tk.Canvas(header, width=sp(12), height=sp(12), bg=BG,
                              highlightthickness=0)
         self.dot.pack(side="left", padx=(0, sp(8)))
@@ -212,76 +251,135 @@ class CounterPickerApp:
         tk.Label(header, text="LOL COUNTER", bg=BG, fg=GOLD_DIM,
                  font=fnt(9, "bold")).pack(side="right")
 
-        # 按钮行
+        # ===== 顶部按钮行 =====
         btns = tk.Frame(self.root, bg=BG)
         btns.pack(fill="x", padx=sp(14), pady=(sp(2), sp(6)))
         self.btn_auto = self._mk_button(btns, "↩ 恢复自动识别", self._clear_manual, GOLD_DIM)
         self.btn_auto.pack(side="left")
+        tk.Label(btns, text="段位", bg=BG, fg=MUTED,
+                 font=fnt(9)).pack(side="left", padx=(sp(12), sp(4)))
+        self.var_tier = tk.StringVar()
+        self.combo_tier = ttk.Combobox(
+            btns, textvariable=self.var_tier, state="readonly",
+            values=[t for t, _ in self.TIER_OPTS],
+            font=fnt(9), width=8)
+        self.combo_tier.pack(side="left")
+        self.combo_tier.bind("<<ComboboxSelected>>", self._on_tier_change)
         self.var_top = tk.BooleanVar(value=True)
         tk.Checkbutton(btns, text="窗口置顶", variable=self.var_top, bg=BG, fg=MUTED,
                        selectcolor=CARD, activebackground=BG, activeforeground=TEXT,
                        font=fnt(9), bd=0, command=self._toggle_top).pack(side="right")
 
-        # 手动查询行（内嵌主窗口，不再弹独立窗口）
-        self._build_search_bar()
+        # ===== 双标签页：① 英雄推荐（BP/对线）  ② 符文出装（选齐后整页） =====
+        nb_style = ttk.Style()
+        nb_style.configure("TNotebook", background=BG, borderwidth=0)
+        nb_style.configure("TNotebook.Tab", background=CARD2, foreground=MUTED,
+                           padding=(sp(20), sp(7)), font=fnt(10, "bold"))
+        nb_style.map("TNotebook.Tab",
+                     background=[("selected", CARD)],
+                     foreground=[("selected", GOLD)])
+        self.lbl_footer = tk.Label(self.root, text="", bg=BG, fg=MUTED,
+                                   font=fnt(8), anchor="w")
+        self.lbl_footer.pack(side="bottom", fill="x", padx=sp(14),
+                             pady=(0, sp(6)))
 
-        # 我方信息
-        self.my_frame = self._mk_card(self.root)
-        self.my_frame.pack(fill="x", padx=sp(12), pady=(0, sp(8)))
-        tk.Label(self.my_frame, text="我　方", bg=CARD, fg=GOLD,
-                 font=fnt(9, "bold")).pack(anchor="w", padx=sp(12), pady=(sp(8), sp(2)))
-        self.lbl_my = tk.Label(self.my_frame, text="等待识别…", bg=CARD, fg=MUTED,
-                               font=fnt(11))
-        self.lbl_my.pack(anchor="w", padx=sp(12), pady=(0, sp(10)))
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill="both", expand=True, padx=sp(12), pady=(0, sp(4)))
+        self.page1 = tk.Frame(self.nb, bg=BG)
+        self.page2 = tk.Frame(self.nb, bg=BG)
+        self.nb.add(self.page1, text="①  英雄推荐")
+        self.nb.add(self.page2, text="②  符文出装")
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-        # 对位目标卡片
-        self.target_card = self._mk_card(self.root)
-        self.target_card.pack(fill="x", padx=sp(12), pady=(0, sp(8)))
-        top_row = tk.Frame(self.target_card, bg=CARD)
-        top_row.pack(fill="x", padx=sp(12), pady=(sp(8), sp(2)))
-        tk.Label(top_row, text="对位目标", bg=CARD, fg=GOLD,
-                 font=fnt(9, "bold")).pack(side="left")
-        self.lbl_badge = tk.Label(top_row, text="", bg=CARD, fg=TEAL,
+        # ================= 页面①：英雄推荐 =================
+        # 顶部：手动查询（横排放一行）
+        self._build_search_bar(self.page1)
+
+        p1 = tk.Frame(self.page1, bg=BG)
+        p1.pack(fill="both", expand=True, padx=sp(4), pady=(0, sp(4)))
+        # 左列
+        col_l = tk.Frame(p1, bg=BG)
+        col_l.pack(side="left", fill="both", expand=True, padx=(0, sp(6)))
+        # 右列
+        col_r = tk.Frame(p1, bg=BG)
+        col_r.pack(side="left", fill="both", expand=True)
+
+        # —— 左列顶部：对局概览（我方 VS 对位） ——
+        self.versus_card = self._mk_card(col_l)
+        self.versus_card.pack(fill="x", pady=(0, sp(6)))
+        vs_top = tk.Frame(self.versus_card, bg=CARD)
+        vs_top.pack(fill="x", padx=sp(12), pady=(sp(8), sp(2)))
+        self.lbl_target_title = tk.Label(vs_top, text="对位目标", bg=CARD, fg=GOLD,
+                                         font=fnt(9, "bold"))
+        self.lbl_target_title.pack(side="left")
+        self.lbl_badge = tk.Label(vs_top, text="", bg=CARD, fg=TEAL,
                                   font=fnt(9, "bold"))
         self.lbl_badge.pack(side="right")
-
-        body = tk.Frame(self.target_card, bg=CARD)
-        body.pack(fill="x", padx=sp(12), pady=(sp(2), sp(10)))
-        self.lbl_target_avatar = tk.Label(body, bg=CARD2,
-                                          image=self._placeholder(76, CARD2))
-        self.lbl_target_avatar.pack(side="left", padx=(0, sp(12)))
-        txt_box = tk.Frame(body, bg=CARD)
-        txt_box.pack(side="left", fill="both", expand=True)
-        self.lbl_target_name = tk.Label(txt_box, text="—", bg=CARD, fg=TEXT,
-                                        font=fnt(15, "bold"), anchor="w")
-        self.lbl_target_name.pack(anchor="w", pady=(sp(6), 0))
-        self.lbl_target_sub = tk.Label(txt_box, text="进入选将或游戏后自动识别",
-                                       bg=CARD, fg=MUTED, font=fnt(9), anchor="w")
+        vs_body = tk.Frame(self.versus_card, bg=CARD)
+        vs_body.pack(fill="x", padx=sp(12), pady=(sp(2), sp(10)))
+        my_box = tk.Frame(vs_body, bg=CARD)
+        my_box.pack(side="left", fill="y")
+        tk.Label(my_box, text="我　方", bg=CARD, fg=MUTED,
+                 font=fnt(8)).pack(anchor="w")
+        self.lbl_my_avatar = tk.Label(my_box, bg=CARD2,
+                                      image=self._placeholder(60, CARD2))
+        self.lbl_my_avatar.pack(anchor="w", pady=(sp(2), sp(4)))
+        self.lbl_my = tk.Label(my_box, text="等待识别…", bg=CARD, fg=MUTED,
+                               font=fnt(10, "bold"), anchor="w",
+                               wraplength=sp(130), justify="left")
+        self.lbl_my.pack(anchor="w")
+        tk.Label(vs_body, text="VS", bg=CARD, fg=GOLD_DIM,
+                 font=fnt(13, "bold")).pack(side="left", padx=sp(12))
+        tg_box = tk.Frame(vs_body, bg=CARD)
+        tg_box.pack(side="left", fill="y")
+        self.lbl_target_avatar = tk.Label(tg_box, bg=CARD2,
+                                          image=self._placeholder(60, CARD2))
+        self.lbl_target_avatar.pack(anchor="w", pady=(sp(12), sp(4)))
+        self.lbl_target_name = tk.Label(tg_box, text="—", bg=CARD, fg=TEXT,
+                                        font=fnt(10, "bold"), anchor="w")
+        self.lbl_target_name.pack(anchor="w")
+        self.lbl_target_sub = tk.Label(tg_box, text="进入选将或游戏后自动识别",
+                                       bg=CARD, fg=MUTED, font=fnt(8), anchor="w",
+                                       wraplength=sp(170), justify="left")
         self.lbl_target_sub.pack(anchor="w", pady=(sp(2), 0))
 
-        # 敌方阵容
-        self.enemy_card = self._mk_card(self.root)
-        self.enemy_card.pack(fill="x", padx=sp(12), pady=(0, sp(8)))
+        # —— 左列底部：敌方阵容（横向 5 头像） ——
+        self.enemy_card = self._mk_card(col_l)
+        self.enemy_card.pack(fill="x", pady=(0, sp(6)))
         tk.Label(self.enemy_card, text="敌方阵容（点击头像可切换查询目标）",
                  bg=CARD, fg=GOLD, font=fnt(9, "bold")).pack(
             anchor="w", padx=sp(12), pady=(sp(8), sp(4)))
         self.enemy_row = tk.Frame(self.enemy_card, bg=CARD)
-        self.enemy_row.pack(fill="x", padx=sp(12), pady=(0, sp(10)))
+        self.enemy_row.pack(fill="x", padx=sp(10), pady=(0, sp(8)))
 
-        # 推荐区（可滚动）
-        rec_card = self._mk_card(self.root)
-        rec_card.pack(fill="both", expand=True, padx=sp(12), pady=(0, sp(8)))
-        rec_head = tk.Frame(rec_card, bg=CARD)
+        # —— 右列顶部：全路对位总览（常驻，未就绪显示提示） ——
+        self.overview_card = self._mk_card(col_r)
+        self.overview_card.pack(fill="x", pady=(0, sp(6)))
+        ov_head = tk.Frame(self.overview_card, bg=CARD)
+        ov_head.pack(fill="x", padx=sp(12), pady=(sp(8), sp(2)))
+        self.lbl_ov_title = tk.Label(ov_head, text="全 路 对 位", bg=CARD, fg=GOLD,
+                                     font=fnt(9, "bold"))
+        self.lbl_ov_title.pack(side="left")
+        self.lbl_ov_summary = tk.Label(ov_head, text="", bg=CARD, fg=MUTED,
+                                       font=fnt(8))
+        self.lbl_ov_summary.pack(side="right")
+        self.ov_body = tk.Frame(self.overview_card, bg=CARD)
+        self.ov_body.pack(fill="x", padx=sp(10), pady=(0, sp(8)))
+        self._ov_widgets: list[tk.Widget] = []
+
+        # —— 右列底部：克制推荐（可滚动，占满剩余高度） ——
+        self.rec_card = self._mk_card(col_r)
+        self.rec_card.pack(fill="both", expand=True)
+        rec_head = tk.Frame(self.rec_card, bg=CARD)
         rec_head.pack(fill="x", padx=sp(12), pady=(sp(8), sp(4)))
-        tk.Label(rec_head, text="克 制 推 荐", bg=CARD, fg=GOLD,
-                 font=fnt(11, "bold")).pack(side="left")
+        self.lbl_rec_title = tk.Label(rec_head, text="克 制 推 荐", bg=CARD, fg=GOLD,
+                                      font=fnt(10, "bold"))
+        self.lbl_rec_title.pack(side="left")
         self.lbl_source = tk.Label(rec_head, text="", bg=CARD, fg=MUTED,
                                    font=fnt(8))
         self.lbl_source.pack(side="right")
-
-        self.rec_canvas = tk.Canvas(rec_card, bg=CARD, highlightthickness=0,
-                                    height=sp(300))
-        scroll = ttk.Scrollbar(rec_card, orient="vertical",
+        self.rec_canvas = tk.Canvas(self.rec_card, bg=CARD, highlightthickness=0)
+        scroll = ttk.Scrollbar(self.rec_card, orient="vertical",
                                command=self.rec_canvas.yview)
         self.rec_inner = tk.Frame(self.rec_canvas, bg=CARD)
         self.rec_inner.bind(
@@ -292,16 +390,47 @@ class CounterPickerApp:
                                                      anchor="nw")
         self.rec_canvas.configure(yscrollcommand=scroll.set)
         self.rec_canvas.pack(side="left", fill="both", expand=True,
-                             padx=(sp(10), 0), pady=(0, sp(8)))
+                             padx=(sp(8), 0), pady=(0, sp(8)))
         scroll.pack(side="right", fill="y", pady=(0, sp(8)))
         self.rec_canvas.bind_all("<MouseWheel>",
                                  lambda e: self.rec_canvas.yview_scroll(
                                      int(-e.delta / 120), "units"))
         self.rec_canvas.bind("<Configure>", self._on_rec_canvas_configure)
-
         self.lbl_hint = tk.Label(self.rec_inner, text="等待对位数据…", bg=CARD,
                                  fg=MUTED, font=fnt(10))
         self.lbl_hint.pack(pady=sp(30))
+
+        # ================= 页面②：符文出装（整页） =================
+        # 顶部：英雄信息条
+        self.build_head_card = self._mk_card(self.page2)
+        self.build_head_card.pack(fill="x", padx=sp(6), pady=(sp(6), sp(6)))
+        bh = tk.Frame(self.build_head_card, bg=CARD)
+        bh.pack(fill="x", padx=sp(14), pady=sp(10))
+        self.lbl_build_avatar = tk.Label(bh, bg=CARD2,
+                                         image=self._placeholder(64, CARD2))
+        self.lbl_build_avatar.pack(side="left", padx=(0, sp(14)))
+        bh_txt = tk.Frame(bh, bg=CARD)
+        bh_txt.pack(side="left", fill="y")
+        self.lbl_build_name = tk.Label(bh_txt, text="尚未确定英雄", bg=CARD, fg=TEXT,
+                                       font=fnt(15, "bold"), anchor="w")
+        self.lbl_build_name.pack(anchor="w", pady=(sp(4), 0))
+        self.lbl_build_meta = tk.Label(bh_txt, text="双方英雄选齐后，在此整页查看符文与出装",
+                                       bg=CARD, fg=MUTED, font=fnt(9), anchor="w")
+        self.lbl_build_meta.pack(anchor="w", pady=(sp(2), 0))
+        # 右侧胜率/场次
+        self.lbl_build_stat = tk.Label(bh, text="", bg=CARD, fg=TEAL,
+                                       font=fnt(12, "bold"))
+        self.lbl_build_stat.pack(side="right")
+
+        # 内容三列：符文 / 装备 / 技能与召唤师
+        self.build_body = tk.Frame(self.page2, bg=BG)
+        self.build_body.pack(fill="both", expand=True, padx=sp(6))
+        self.c_runes = self._mk_card(self.build_body)
+        self.c_items = self._mk_card(self.build_body)
+        self.c_skill = self._mk_card(self.build_body)
+        self.c_runes.pack(side="left", fill="both", expand=True, padx=(0, sp(6)))
+        self.c_items.pack(side="left", fill="both", expand=True, padx=(0, sp(6)))
+        self.c_skill.pack(side="left", fill="both", expand=True)
 
         self.lbl_footer = tk.Label(self.root, text="", bg=BG, fg=MUTED,
                                    font=fnt(8), anchor="w")
@@ -372,10 +501,19 @@ class CounterPickerApp:
         while not self.stop_ev.is_set():
             try:
                 snap = self.engine.poll()
-                target = self.engine.target_enemy(snap)
                 manual = bool(self.engine.manual_enemy_id)
-                lane = self.engine.manual_lane if manual else snap.my_lane
-                key = (target, lane or "auto") if target else None
+                # 查询模式：手动点选/敌方已锁定 -> 对位推荐（counter）；
+                # 我方已锁定但敌方还没目标 -> 显示"最克制我方英雄"的受克制榜（ban）
+                ban_mode = (not manual) and bool(snap.my_champ_id) and not snap.auto_enemy_id
+                if ban_mode:
+                    target = snap.my_champ_id
+                    # 用我方分路查对位数据；分路未知则按英雄定位粗略猜测
+                    lane = snap.my_lane or self._guess_lane(target)
+                else:
+                    target = self.engine.target_enemy(snap)
+                    lane = self.engine.manual_lane if manual else snap.my_lane
+                self._ban_mode = ban_mode
+                key = (target, lane or "auto", ban_mode) if target else None
 
                 if target and key != self._rec_key:
                     self._rec_key = key
@@ -407,6 +545,43 @@ class CounterPickerApp:
                     self._rec_key = None
                     self._last_recs = ([], "")
                     self._online_pending = False
+                    self._ban_mode = False
+
+                # ---- 符文出装：优先展示我方英雄；我方未知时展示对位目标 ----
+                build_cid = (snap.my_champ_id
+                             or (target if not ban_mode else None))
+                build_lane = (snap.my_lane
+                              if snap.my_champ_id else (lane or "auto"))
+                if build_cid:
+                    bkey = (build_cid, build_lane or "auto")
+                    if bkey != self._build_key:
+                        bc = self.engine.recommender.build_cached(
+                            build_cid, build_lane if build_lane != "auto" else "top")
+                        if bc:
+                            self._build_key = bkey
+                            self._build_info = bc
+                            self.q.put(("build_ready", bc))
+                        else:
+                            # 先锁定 key，避免回包时与旧 key 校验失败而丢弃新数据
+                            self._build_key = bkey
+                            self._build_info = None
+                            self.q.put(("build_loading", bkey))
+                            def _do_fetch(_cid=build_cid,
+                                          _ln=(build_lane if build_lane != "auto" else "top"),
+                                          _bkey=bkey):
+                                try:
+                                    bi = self.engine.recommender.build_fetch(_cid, _ln)
+                                except Exception:
+                                    bi = None
+                                # 仅当玩家仍停留在同一英雄时采用结果
+                                if bi and _bkey == self._build_key:
+                                    self.q.put(("build_ready", bi))
+                            threading.Thread(target=_do_fetch, daemon=True).start()
+                else:
+                    if self._build_key is not None:
+                        self._build_key = None
+                        self._build_info = None
+                        self.q.put(("build_hide", None))
 
                 # 预下载本次需要的高清头像
                 ens: dict[int, str] = {}
@@ -423,6 +598,9 @@ class CounterPickerApp:
                     if info:
                         ens[target] = info["en"]
                 for c in self._last_recs[0]:
+                    # ban 模式下跳过已被 ban 的英雄
+                    if ban_mode and c.champion_id in snap.bans:
+                        continue
                     # 正在拉在线数据时跳过推荐头像：避免与排行榜请求抢带宽；
                     # 下一轮（数据已就绪）会自动补下载
                     if not self._online_pending:
@@ -435,6 +613,23 @@ class CounterPickerApp:
                 self.q.put(("state", (snap, self._last_recs, manual, lane)))
                 if got_new:
                     self.q.put(("avatars", None))
+
+                # ---- 全路对位总览：双方各锁定至少 3 人时才查 ----
+                self._maybe_overview(snap)
+
+                # ---- 双方 10 人选齐且我方已锁定：自动跳到符文出装页 ----
+                full = (snap.my_champ_id
+                        and len(snap.allies) >= 5
+                        and len(snap.enemies) >= 5)
+                if full:
+                    if not self._auto_switched:
+                        self._auto_switched = True
+                        self.q.put(("goto_build", None))
+                else:
+                    # 阵容未满（新一局/退回选将）：重置，允许下一局再次自动跳
+                    if self._auto_switched:
+                        self._auto_switched = False
+                        self.q.put(("goto_rec", None))
             except Exception as e:
                 self.q.put(("error", str(e)))
             self.wake.wait(max(1.0, self.cfg.poll_interval))
@@ -462,15 +657,219 @@ class CounterPickerApp:
                         self._render()
                 elif kind == "error":
                     self.lbl_status.configure(text=f"运行异常：{payload}")
+                elif kind == "build_loading":
+                    self.lbl_build_meta.configure(text="正在获取符文与出装…")
+                elif kind == "build_ready":
+                    self._build_info = payload
+                    self._build_cid = payload.champion_id
+                    self._build_key = (payload.champion_id, payload.lane)
+                    self._build_dirty = True
+                    if self.nb.index("current") == 1:
+                        self._render_build()
+                elif kind == "build_hide":
+                    self._build_info = None
+                    self._build_cid = 0
+                    self._build_key = None
+                    self._build_dirty = True
+                    self._reset_build_placeholder()
+                elif kind == "ov_show":
+                    self._render_overview()
+                elif kind == "ov_hide":
+                    self._render_overview_placeholder()
+                elif kind == "ov_row":
+                    self._on_ov_row(payload)
+                elif kind == "goto_build":
+                    self._switch_to_build_tab()
+                elif kind == "goto_rec":
+                    if self.nb.index("current") != 0:
+                        self.nb.select(0)
         except queue.Empty:
             pass
         self.root.after(200, self._drain_queue)
 
-    # ---------------- 渲染 ----------------
+    # ---------------- 符文出装 ----------------
+    def _on_tab_changed(self, _evt=None):
+        # 切到符文出装页且数据是新的，就重渲染整页
+        if self.nb.index("current") == 1 and self._build_info \
+                and self._build_dirty:
+            self._render_build()
+
+    def _switch_to_build_tab(self):
+        if self.nb.index("current") != 1:
+            self.nb.select(1)
+
+    def _reset_build_placeholder(self):
+        for col in (self.c_runes, self.c_items, self.c_skill):
+            for w in col.winfo_children():
+                w.destroy()
+        self.lbl_build_name.configure(text="尚未确定英雄")
+        self.lbl_build_meta.configure(text="双方英雄选齐后，在此整页查看符文与出装")
+        self.lbl_build_stat.configure(text="")
+        ph = self._placeholder(64, CARD2)
+        self.lbl_build_avatar.configure(image=ph, width=sp(64), height=sp(64))
+        self.lbl_build_avatar.image = ph
+
+    def _load_local_image(self, path, size: int):
+        """本地图片文件 -> 缩略 PhotoImage（支持 png/webp）。"""
+        try:
+            if _HAS_PIL:
+                im = Image.open(str(path)).convert("RGBA").resize(
+                    (sp(size), sp(size)), Image.LANCZOS)
+                return ImageTk.PhotoImage(im)
+            return tk.PhotoImage(file=str(path))
+        except Exception:
+            return None
+
+    def _build_img(self, url: str, size: int):
+        """下载/取缓存 build 图标 URL -> PhotoImage（失败返回 None）。"""
+        if not url:
+            return None
+        ck = f"{url}@{size}"
+        if ck in self._build_imgs:
+            return self._build_imgs[ck]
+        p = self._fetch_url_image(url)
+        img = self._load_local_image(p, size) if p else None
+        if img is not None:
+            self._build_imgs[ck] = img
+        return img
+
+    def _fetch_url_image(self, url: str):
+        """下载 URL 图标到本地图标缓存，返回路径（已存在则直接返回）。"""
+        import hashlib
+        ext = ".png" if ".png" in url.lower() else ".webp"
+        h = hashlib.md5(url.encode()).hexdigest()[:16]
+        path = ICON_DIR / f"b_{h}{ext}"
+        if path.exists():
+            return path
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200 and r.content:
+                path.write_bytes(r.content)
+                return path
+        except Exception:
+            return None
+        return None
+
+    def _render_build(self):
+        b = self._build_info
+        if not b:
+            return
+        for col in (self.c_runes, self.c_items, self.c_skill):
+            for w in col.winfo_children():
+                w.destroy()
+
+        def col_title(parent, text):
+            tk.Label(parent, text=text, bg=CARD, fg=GOLD,
+                     font=fnt(11, "bold"), anchor="w").pack(
+                anchor="w", padx=sp(14), pady=(sp(12), sp(6)))
+
+        def icon_cell(parent, url, size, bg=CARD):
+            im = self._build_img(url, size)
+            lbl = tk.Label(parent, bg=bg)
+            if im:
+                lbl.configure(image=im, width=sp(size), height=sp(size))
+            else:
+                lbl.configure(image=self._placeholder(size, CARD2),
+                              width=sp(size), height=sp(size))
+            return lbl
+
+        def icon_row(parent, urls, size, gap=6):
+            row = tk.Frame(parent, bg=CARD)
+            row.pack(anchor="w", padx=sp(14), pady=(0, sp(6)))
+            for u in urls:
+                icon_cell(row, u, size).pack(side="left", padx=(0, sp(gap)))
+            return row
+
+        # ---------- 第1列：符文 ----------
+        col_title(self.c_runes, "符文")
+        # 基石符文
+        kf = tk.Frame(self.c_runes, bg=CARD)
+        kf.pack(anchor="w", padx=sp(14), pady=(0, sp(10)))
+        icon_cell(kf, b.keystone_url, 52).pack(side="left")
+        tk.Label(kf, text="基石符文", bg=CARD, fg=MUTED,
+                 font=fnt(9)).pack(side="left", padx=sp(10))
+        # 小符文：按系分组
+        trees: dict[str, list] = {}
+        for r in b.runes:
+            trees.setdefault(r.get("tree", ""), []).append(r["url"])
+        for urls in trees.values():
+            icon_row(self.c_runes, urls, 32, gap=6)
+        # 属性碎片
+        tk.Label(self.c_runes, text="属性碎片", bg=CARD, fg=MUTED,
+                 font=fnt(8), anchor="w").pack(anchor="w", padx=sp(14),
+                                               pady=(sp(6), sp(2)))
+        icon_row(self.c_runes, b.shards, 24, gap=6)
+
+        # ---------- 第2列：出装 ----------
+        col_title(self.c_items, "出装")
+        if b.start_items:
+            tk.Label(self.c_items, text="出门装", bg=CARD, fg=MUTED,
+                     font=fnt(8), anchor="w").pack(anchor="w", padx=sp(14),
+                                                   pady=(0, sp(2)))
+            icon_row(self.c_items, b.start_items, 38)
+        tk.Label(self.c_items, text="核心装备", bg=CARD, fg=MUTED,
+                 font=fnt(8), anchor="w").pack(anchor="w", padx=sp(14),
+                                               pady=(sp(8), sp(2)))
+        icon_row(self.c_items, b.core_items, 40)
+        if b.boots_url:
+            tk.Label(self.c_items, text="鞋子", bg=CARD, fg=MUTED,
+                     font=fnt(8), anchor="w").pack(anchor="w", padx=sp(14),
+                                                   pady=(sp(8), sp(2)))
+            icon_row(self.c_items, [b.boots_url], 38)
+
+        # ---------- 第3列：召唤师技能 + 技能加点 ----------
+        col_title(self.c_skill, "召唤师技能")
+        sprow = tk.Frame(self.c_skill, bg=CARD)
+        sprow.pack(anchor="w", padx=sp(14), pady=(0, sp(10)))
+        for u in b.summoner:
+            cell = tk.Frame(sprow, bg=CARD)
+            cell.pack(side="left", padx=(0, sp(10)))
+            icon_cell(cell, u, 42).pack()
+        if b.skill_order:
+            tk.Label(self.c_skill, text="技能加点（前 5 级）", bg=CARD, fg=MUTED,
+                     font=fnt(8), anchor="w").pack(anchor="w", padx=sp(14),
+                                                   pady=(sp(6), sp(4)))
+            grid = tk.Frame(self.c_skill, bg=CARD)
+            grid.pack(anchor="w", padx=sp(14))
+            for i, sk in enumerate(b.skill_order, 1):
+                cell = tk.Frame(grid, bg=CARD2)
+                cell.pack(side="left", padx=(0, sp(5)))
+                tk.Label(cell, text=str(i), bg=CARD2, fg=MUTED,
+                         font=fnt(7)).pack(padx=sp(4), pady=(sp(2), 0))
+                tk.Label(cell, text=sk, bg=CARD2, fg=TEAL,
+                         font=fnt(11, "bold")).pack(padx=sp(5), pady=(0, sp(3)))
+
+        # ---------- 顶部英雄信息条 ----------
+        cid = getattr(self, "_build_cid", 0)
+        if cid:
+            info = self.engine.db.by_champion_id(cid)
+            self.lbl_build_name.configure(text=info["name"])
+            lane_txt = LANE_CN.get(b.lane, "")
+            meta = f"{info['en']}" + (f"　｜　{lane_txt}" if lane_txt else "")
+            meta += f"　｜　版本 {b.patch}" if b.patch else ""
+            self.lbl_build_meta.configure(text=meta)
+            av = self._get_photo(cid, info["en"], 64)
+            if av:
+                self.lbl_build_avatar.configure(
+                    image=av, width=sp(64), height=sp(64))
+                self.lbl_build_avatar.image = av
+        stat = ""
+        if b.win_rate:
+            stat = f"{b.win_rate:.1f}% 胜率"
+            if b.games:
+                stat += f"\n{b.games:,} 场"
+        self.lbl_build_stat.configure(text=stat, justify="right")
+        self._build_dirty = False
+
+    # ---------------- 渲染（原） ----------------
     def _render(self):
         snap = self._snap
         recs, source = self._last_recs
-        target = self.engine.target_enemy(snap) if snap else 0
+        ban = self._ban_mode
+        if ban and snap:
+            target = snap.my_champ_id
+        else:
+            target = self.engine.target_enemy(snap) if snap else 0
 
         color, phase_txt = PHASE_DOT.get(snap.phase if snap else "starting",
                                          PHASE_DOT["starting"])
@@ -480,19 +879,42 @@ class CounterPickerApp:
         if snap and snap.my_champ_id:
             info = self.engine.db.by_champion_id(snap.my_champ_id)
             lane_txt = f"｜{LANE_CN.get(snap.my_lane, '')}" if snap.my_lane else ""
-            self.lbl_my.configure(text=f"{info['name']}（{info['en']}）{lane_txt}",
+            self.lbl_my.configure(text=f"{info['name']}{lane_txt}",
                                   fg=TEXT)
+            my_img = self._get_photo(snap.my_champ_id, info["en"], 64)
+            if my_img:
+                self.lbl_my_avatar.configure(
+                    image=my_img, width=sp(64), height=sp(64))
+                self.lbl_my_avatar.image = my_img
+            else:
+                self.lbl_my_avatar.configure(
+                    image=self._placeholder(64, CARD2), width=sp(64), height=sp(64))
         else:
             self.lbl_my.configure(text="等待识别…", fg=MUTED)
+            self.lbl_my_avatar.configure(
+                image=self._placeholder(64, CARD2), text="?", fg=MUTED,
+                compound="center", font=fnt(14, "bold"),
+                width=sp(64), height=sp(64))
+
+        if ban:
+            self.lbl_target_title.configure(text="我的英雄")
+        else:
+            self.lbl_target_title.configure(text="对位目标")
 
         if target:
             info = self.engine.db.by_champion_id(target)
             self.lbl_target_name.configure(text=info["name"])
-            qlane = self._lane or self._guess_lane(target)
-            self.lbl_target_sub.configure(
-                text=f"{info['en']}｜查询分路：{LANE_CN.get(qlane, '自动')}", fg=MUTED)
-            self.lbl_badge.configure(text="● 手动选择" if self._manual else "● 自动识别",
-                                     fg=GOLD if self._manual else TEAL)
+            if ban:
+                sub = f"{info['en']}｜下列英雄最克制 TA"
+            else:
+                qlane = self._lane or self._guess_lane(target)
+                sub = f"{info['en']} · {LANE_CN.get(qlane, '自动')}"
+            self.lbl_target_sub.configure(text=sub, fg=MUTED)
+            if ban:
+                self.lbl_badge.configure(text="● 受克制榜", fg=RED)
+            else:
+                self.lbl_badge.configure(text="● 手动选择" if self._manual else "● 自动识别",
+                                         fg=GOLD if self._manual else TEAL)
             self._set_target_avatar(target, info["en"])
         else:
             self.lbl_target_name.configure(text="—")
@@ -500,9 +922,9 @@ class CounterPickerApp:
                                           fg=MUTED)
             self.lbl_badge.configure(text="")
             self.lbl_target_avatar.configure(
-                image=self._placeholder(76, CARD2), text="?", fg=MUTED,
-                compound="center", font=fnt(16, "bold"),
-                width=sp(76), height=sp(76))
+                image=self._placeholder(64, CARD2), text="?", fg=MUTED,
+                compound="center", font=fnt(14, "bold"),
+                width=sp(64), height=sp(64))
 
         self._render_enemies(snap, target)
         self._render_recs(recs, source, target)
@@ -527,16 +949,16 @@ class CounterPickerApp:
         return "middle"
 
     def _set_target_avatar(self, cid: int, en: str):
-        img = self._get_photo(cid, en, 76)
+        img = self._get_photo(cid, en, 64)
         if img:
             self.lbl_target_avatar.configure(image=img, text="",
-                                             width=sp(76), height=sp(76))
+                                             width=sp(64), height=sp(64))
             self.lbl_target_avatar.image = img
         else:
             self.lbl_target_avatar.configure(
-                image=self._placeholder(76, CARD2), text="?", fg=MUTED,
-                compound="center", font=fnt(16, "bold"),
-                width=sp(76), height=sp(76))
+                image=self._placeholder(64, CARD2), text="?", fg=MUTED,
+                compound="center", font=fnt(14, "bold"),
+                width=sp(64), height=sp(64))
 
     def _render_enemies(self, snap, target):
         for w in self._enemy_widgets:
@@ -573,6 +995,14 @@ class CounterPickerApp:
             w.destroy()
         self._row_widgets = []
         self.lbl_hint.pack_forget()
+
+        ban = self._ban_mode
+        if ban:
+            # ban 模式：去掉已经被 ban 掉的英雄
+            banned = set(self._snap.bans if self._snap else [])
+            recs = [c for c in recs if c.champion_id not in banned]
+
+        self.lbl_rec_title.configure(text="受 克 制 榜" if ban else "克 制 推 荐")
 
         if not target:
             self.lbl_hint.configure(text="进入选将阶段或游戏后，这里会给出克制推荐")
@@ -611,9 +1041,13 @@ class CounterPickerApp:
             tk.Label(name_box, text=en, bg=row_bg, fg=MUTED,
                      font=fnt(7), anchor="w").pack(anchor="w")
 
-            pct = tk.Label(row, text=f"{c.my_winrate:.1f}%", bg=row_bg,
-                           fg=self._wr_color(c.my_winrate),
-                           font=fnt(12, "bold"))
+            # 胜率语义：counter 模式显示我方对位胜率（越高越好）；
+            # ban 模式显示我方英雄对其胜率（越低=越被克制，越该 ban）
+            disp = c.enemy_winrate if ban else c.my_winrate
+            col = (self._ban_wr_color(disp) if ban else self._wr_color(disp))
+
+            pct = tk.Label(row, text=f"{disp:.1f}%", bg=row_bg,
+                           fg=col, font=fnt(12, "bold"))
             pct.pack(side="right", padx=sp(10))
 
             bar_w, bar_h = sp(92), sp(10)
@@ -621,14 +1055,22 @@ class CounterPickerApp:
                             highlightthickness=0)
             bar.pack(side="right", padx=sp(4))
             bar.create_rectangle(0, sp(3), bar_w, sp(9), fill=BORDER, outline="")
-            frac = max(0.05, min(1.0, (c.my_winrate - 46.0) / 10.0))
+            # 进度条统一表示"克制强度"：ban 模式胜率越低条越长
+            if ban:
+                frac = max(0.05, min(1.0, (54.0 - disp) / 10.0))
+            else:
+                frac = max(0.05, min(1.0, (disp - 46.0) / 10.0))
             bar.create_rectangle(0, sp(3), int(bar_w * frac), sp(9),
-                                 fill=self._wr_color(c.my_winrate), outline="")
+                                 fill=col, outline="")
             self._row_widgets.extend([row, rk, avatar, name_box, pct, bar]
                                      + name_box.winfo_children())
 
         tag = "在线数据" if source in ("lolalytics", "blitz") else "离线表"
-        self.lbl_source.configure(text=f"数据源：{tag}　·　按克制幅度排序（胜率为我方对位胜率）")
+        if ban:
+            note = "建议队友 Ban　·　胜率为我方英雄对其胜率（越低越该 Ban）"
+        else:
+            note = "按克制幅度排序（胜率为我方对位胜率）"
+        self.lbl_source.configure(text=f"数据源：{tag}　·　{note}")
 
     @staticmethod
     def _wr_color(wr: float) -> str:
@@ -639,6 +1081,126 @@ class CounterPickerApp:
         if wr >= 50:
             return GOLD_DIM
         return MUTED
+
+    @staticmethod
+    def _ban_wr_color(wr: float) -> str:
+        # 我方胜率越低=越被克制，越该 ban，颜色越红
+        if wr <= 47:
+            return RED
+        if wr <= 49:
+            return "#E8804A"
+        if wr <= 50:
+            return GOLD_DIM
+        return MUTED
+
+    # ---------------- 全路对位总览 ----------------
+    def _maybe_overview(self, snap):
+        """双方各锁定至少 3 人才触发；阵容指纹变化时后台批量查询。"""
+        if len(snap.allies) < 3 or len(snap.enemies) < 3:
+            if self._ov_fp is not None:
+                self._ov_fp = None
+                self._ov_data = {}
+                self.q.put(("ov_hide", None))
+            return
+        pairs = self.engine.lane_matchups(snap)
+        fp = tuple(sorted(
+            (a.champion_id if a else 0, e.champion_id if e else 0)
+            for _, a, e in pairs))
+        if fp == self._ov_fp:
+            return
+        self._ov_fp = fp
+        self._ov_data = {}
+        self.q.put(("ov_show", None))
+
+        tier = self.engine.recommender.tier
+        db = self.engine.db
+
+        def work():
+            from .matchup import fetch_hero_rows
+            import concurrent.futures
+            tasks = [(ln, a, e) for ln, a, e in pairs if a and e]
+
+            def one(item):
+                ln, a, e = item
+                rows, src = fetch_hero_rows(db, a.champion_id, ln, tier, 5.0)
+                if not rows:
+                    return None
+                for row in rows:
+                    rid = db.id_by_en(str(row["enemy_name"]).strip())
+                    if rid == e.champion_id:
+                        return (ln, a.champion_id, e.champion_id,
+                                float(row["winrate"]), src)
+                return None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+                futs = [ex.submit(one, t) for t in tasks]
+                for f in concurrent.futures.as_completed(futs):
+                    r = f.result()
+                    if r:
+                        self.q.put(("ov_row", r))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_ov_row(self, row):
+        ln, aid, eid, wr, src = row
+        self._ov_data[ln] = (aid, eid, wr, src)
+        self._render_overview()
+
+    def _render_overview_placeholder(self, text="双方各锁定 3 人后显示全路对位"):
+        for w in self._ov_widgets:
+            w.destroy()
+        self._ov_widgets = []
+        tip = tk.Label(self.ov_body, text=text, bg=CARD, fg=MUTED,
+                       font=fnt(9))
+        tip.pack(pady=sp(14))
+        self._ov_widgets.append(tip)
+        self.lbl_ov_summary.configure(text="")
+
+    def _render_overview(self):
+        for w in self._ov_widgets:
+            w.destroy()
+        self._ov_widgets = []
+        if not self._snap:
+            self._render_overview_placeholder()
+            return
+        if len(self._snap.allies) < 3 or len(self._snap.enemies) < 3:
+            self._render_overview_placeholder()
+            return
+        pairs = self.engine.lane_matchups(self._snap)
+        win_n = lose_n = 0
+        for ln, a, e in pairs:
+            if not (a and e):
+                continue
+            row_bg = CARD2
+            row = tk.Frame(self.ov_body, bg=row_bg)
+            row.pack(fill="x", pady=sp(1), ipady=sp(2))
+            tk.Label(row, text=LANE_CN.get(ln, ""), bg=row_bg, fg=GOLD,
+                     font=fnt(9, "bold"), width=4).pack(side="left", padx=(sp(4), 0))
+            self._avatar_label(row, a.champion_id,
+                               self.engine.db.en_of(a.champion_id), 26, bg=row_bg
+                               ).pack(side="left", padx=sp(4))
+            d = self._ov_data.get(ln)
+            if d:
+                wr = d[2]
+                if wr >= 52:
+                    tag, col, win_n = "优", GREEN, win_n + 1
+                elif wr <= 48:
+                    tag, col, lose_n = "劣", RED, lose_n + 1
+                else:
+                    tag, col = "均", GOLD_DIM
+                mid = tk.Label(row, text=f"{wr:.1f}% {tag}", bg=row_bg, fg=col,
+                               font=fnt(9, "bold"))
+            else:
+                mid = tk.Label(row, text="查询中…", bg=row_bg, fg=MUTED,
+                               font=fnt(8))
+            mid.pack(side="left", padx=sp(6))
+            self._avatar_label(row, e.champion_id,
+                               self.engine.db.en_of(e.champion_id), 26, bg=row_bg
+                               ).pack(side="left", padx=sp(4))
+            self._ov_widgets.append(row)
+            self._ov_widgets.extend(row.winfo_children())
+        self.lbl_ov_summary.configure(
+            text=f"我方优势 {win_n} 路　·　劣势 {lose_n} 路")
 
     # ---------------- 交互 ----------------
     def _select_manual(self, cid: int, lane: str):
@@ -673,13 +1235,26 @@ class CounterPickerApp:
         except tk.TclError:
             pass
 
+    def _on_tier_change(self, _event=None):
+        """切换段位：更新配置与查询引擎，并让当前对位/出装按新段位重查。"""
+        idx = self.combo_tier.current()
+        if idx < 0:
+            return
+        tier = self.TIER_OPTS[idx][1]
+        self.cfg.tier = tier
+        self.engine.recommender.tier = tier
+        self.cfg.save()
+        # 清空缓存键，下一轮 worker 检测到不一致即按新段位重新拉取
+        self._rec_key = None
+        self._build_key = None
+
     # ---------------- 内嵌手动查询栏 ----------------
     SEARCH_LANE_OPTS = [("自动", ""), ("上单", "top"), ("打野", "jungle"),
                         ("中单", "middle"), ("下路", "bottom"), ("辅助", "support")]
 
-    def _build_search_bar(self):
-        card = self._mk_card(self.root)
-        card.pack(fill="x", padx=sp(12), pady=(0, sp(8)))
+    def _build_search_bar(self, parent):
+        card = self._mk_card(parent)
+        card.pack(fill="x", padx=sp(4), pady=(sp(2), sp(6)))
 
         self.engine.db.load()
         items = []
@@ -691,30 +1266,25 @@ class CounterPickerApp:
             items.append(f"{head}｜{info['en']}")
         self._champ_names = sorted(set(items))
 
-        tk.Label(card, text="手动查询：输入或选择敌方英雄后回车", bg=CARD,
-                 fg=GOLD, font=fnt(9, "bold")).pack(anchor="w",
-                                                    padx=sp(12), pady=(sp(8), sp(3)))
-
-        row1 = tk.Frame(card, bg=CARD)
-        row1.pack(fill="x", padx=sp(10))
+        row = tk.Frame(card, bg=CARD)
+        row.pack(fill="x", padx=sp(10), pady=sp(8))
+        tk.Label(row, text="手动查询", bg=CARD, fg=GOLD,
+                 font=fnt(9, "bold")).pack(side="left", padx=(0, sp(8)))
         self.var_search = tk.StringVar()
-        self.combo_search = ttk.Combobox(row1, textvariable=self.var_search,
+        self.combo_search = ttk.Combobox(row, textvariable=self.var_search,
                                          values=self._champ_names, font=fnt(10))
         self.combo_search.pack(side="left", fill="x", expand=True)
         self.combo_search.bind("<KeyRelease>", self._filter_champs)
         self.combo_search.bind("<Return>", lambda e: self._do_search())
-        self._mk_button(row1, "查询", self._do_search, TEAL).pack(
-            side="left", padx=(sp(8), 0))
-
-        row2 = tk.Frame(card, bg=CARD)
-        row2.pack(fill="x", padx=sp(10), pady=(sp(6), sp(8)))
-        tk.Label(row2, text="分路", bg=CARD, fg=MUTED,
-                 font=fnt(9)).pack(side="left", padx=(0, sp(4)))
+        tk.Label(row, text="分路", bg=CARD, fg=MUTED,
+                 font=fnt(9)).pack(side="left", padx=(sp(10), sp(4)))
         self.var_search_lane = tk.StringVar(value="自动")
         self.combo_lane = ttk.Combobox(
-            row2, textvariable=self.var_search_lane, state="readonly",
+            row, textvariable=self.var_search_lane, state="readonly",
             values=[t for t, _ in self.SEARCH_LANE_OPTS], font=fnt(9), width=6)
         self.combo_lane.pack(side="left")
+        self._mk_button(row, "查询", self._do_search, TEAL).pack(
+            side="left", padx=(sp(8), 0))
 
     def _filter_champs(self, _evt=None):
         q = self.var_search.get().strip().lower()

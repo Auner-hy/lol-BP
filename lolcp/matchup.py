@@ -68,17 +68,17 @@ class Counter:
         return round(100.0 - self.enemy_winrate, 2)
 
 
-# 缓存格式版本：修正 lolalytics 胜率语义后，旧缓存必须作废
-CACHE_VERSION = "v2"
+# 缓存格式版本：缓存文件名加入段位维度后，旧缓存必须作废
+CACHE_VERSION = "v3"
 
 
 # ---------------- 缓存 ----------------
-def _cache_path(provider: str, enemy_slug: str, lane: str) -> Path:
-    return CACHE_DIR / f"{provider}_{CACHE_VERSION}_{enemy_slug}_{lane}.json"
+def _cache_path(provider: str, enemy_slug: str, lane: str, tier: str) -> Path:
+    return CACHE_DIR / f"{provider}_{CACHE_VERSION}_{enemy_slug}_{lane}_{tier}.json"
 
 
-def _cache_read(provider: str, enemy_slug: str, lane: str) -> Optional[list]:
-    p = _cache_path(provider, enemy_slug, lane)
+def _cache_read(provider: str, enemy_slug: str, lane: str, tier: str) -> Optional[list]:
+    p = _cache_path(provider, enemy_slug, lane, tier)
     if p.exists():
         try:
             obj = json.loads(p.read_text(encoding="utf-8"))
@@ -89,9 +89,10 @@ def _cache_read(provider: str, enemy_slug: str, lane: str) -> Optional[list]:
     return None
 
 
-def _cache_write(provider: str, enemy_slug: str, lane: str, counters: list) -> None:
+def _cache_write(provider: str, enemy_slug: str, lane: str, tier: str,
+                 counters: list) -> None:
     try:
-        _cache_path(provider, enemy_slug, lane).write_text(
+        _cache_path(provider, enemy_slug, lane, tier).write_text(
             json.dumps({"ts": time.time(), "counters": counters}, ensure_ascii=False),
             encoding="utf-8")
     except Exception:
@@ -115,13 +116,17 @@ _LOLA_RE_CARD = re.compile(
     r'alt="([A-Z][^"]+)"[^>]*class="rounded border', re.S)
 
 
-def fetch_lolalytics(enemy_slug: str, lane: str, timeout: float = 12.0) -> Optional[List[dict]]:
+def fetch_lolalytics(enemy_slug: str, lane: str, timeout: float = 12.0,
+                     tier: str = "emerald_plus") -> Optional[List[dict]]:
     """返回 [{enemy_name, winrate, score}]。
 
     winrate = 敌方目标英雄对位该推荐英雄时的胜率（%），越低代表该推荐英雄
     越克制目标；score = 归一化克制幅度（负数=克制，越小越克制），用于排序。
+    tier = 段位筛选（gold_plus/platinum_plus/emerald_plus/diamond_plus/
+    master_plus，已实测全部为有效参数）。
     """
-    url = f"https://lolalytics.com/lol/{enemy_slug}/counters/?lane={lane}"
+    url = (f"https://lolalytics.com/lol/{enemy_slug}/counters/"
+           f"?lane={lane}&tier={tier}")
     r = _session("lola").get(
         url, headers={"Accept-Language": "en;q=0.9"}, timeout=timeout)
     r.raise_for_status()
@@ -158,7 +163,9 @@ def fetch_lolalytics(enemy_slug: str, lane: str, timeout: float = 12.0) -> Optio
 
 
 # ---------------- Provider: Blitz (best effort) ----------------
-def fetch_blitz(enemy_slug: str, lane: str, timeout: float = 12.0) -> Optional[List[dict]]:
+def fetch_blitz(enemy_slug: str, lane: str, timeout: float = 12.0,
+                tier: str = "emerald_plus") -> Optional[List[dict]]:
+    # tier 仅用于缓存分桶（Blitz 页面不分段位），不参与请求 URL
     url = f"https://blitz.gg/lol/champions/{enemy_slug}/counters?role={lane.upper()}"
     try:
         r = _session("blitz").get(url, timeout=timeout)
@@ -213,13 +220,262 @@ def fetch_offline(enemy_en: str, lane: str) -> Optional[List[dict]]:
 
 
 # ---------------- 推荐引擎 ----------------
+def fetch_hero_rows(db: ChampionDB, hero_id: int, lane: str, tier: str,
+                    timeout: float = 5.0) -> tuple[Optional[list], str]:
+    """拿某英雄在指定分路的整页对位行：先读磁盘缓存，未命中再发请求并写缓存。
+    返回 (rows, source)；全失败返回 (None, "")。供全路总览批量查询使用。"""
+    info = db.by_champion_id(hero_id)
+    if not info:
+        return None, ""
+    slug, ql = info["slug"], lane or "top"
+    cached = _cache_read("lola", slug, ql, tier)
+    if cached is not None:
+        return cached, "lolalytics"
+    try:
+        rows = fetch_lolalytics(slug, ql, timeout, tier)
+        if rows:
+            _cache_write("lola", slug, ql, tier, rows)
+            return rows, "lolalytics"
+    except Exception:
+        pass
+    cached = _cache_read("blitz", slug, ql, tier)
+    if cached is not None:
+        return cached, "blitz"
+    try:
+        rows = fetch_blitz(slug, ql, timeout, tier)
+        if rows:
+            _cache_write("blitz", slug, ql, tier, rows)
+            return rows, "blitz"
+    except Exception:
+        pass
+    return None, ""
+
+
+# ============================= 通用符文 / 出装 =============================
+# Data Dragon / Community Dragon 都是 Riot 官方公开静态资源（无需 key）
+# 符文图标在 Community Dragon；装备/召唤师技能图标在 Data Dragon。
+_DD_VERSION = "16.19.1"   # 图标版本（静态资源，稳定）
+_PERKS_URL = ("https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/"
+              "global/default/v1/perks.json")
+_SUMMONER_URL = (f"https://ddragon.leagueoflegends.com/cdn/{_DD_VERSION}"
+                 "/data/en_US/summoner.json")
+_CD_BASE = ("https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/"
+            "global/default/")
+_PERK_ICON_URLS: dict[int, str] = {}   # 符文ID -> 图标URL（首次使用时加载）
+_SUMMONER_ICON: dict[str, str] = {}    # 召唤师技能数字ID -> 图标文件名
+_BOOT_IDS: set[int] = set()            # 鞋类装备ID（由 Data Dragon 标签识别）
+
+
+@dataclass
+class BuildInfo:
+    """单个英雄单分路的通用推荐（不区分对位）。所有 *_url 为图标地址。"""
+    champion_id: int
+    lane: str
+    patch: str
+    keystone_id: int
+    keystone_url: str
+    runes: List[dict]          # [{"id","url","tree"}] 基石之外的小符文
+    shards: List[str]          # 3 个碎片的图标URL
+    summoner: List[str]        # 2 个召唤师技能图标URL
+    start_items: List[str]     # 出门装图标URL
+    core_items: List[str]      # 核心装图标URL（3件）
+    boots_url: str             # 鞋子图标URL
+    skill_order: List[str]     # 前5级加点，元素 Q/W/E/R
+    games: int
+    win_rate: float
+
+
+def _item_url(item_id) -> str:
+    """装备数字ID -> Data Dragon 图标URL（兼容字符串ID）。"""
+    return (f"https://ddragon.leagueoflegends.com/cdn/{_DD_VERSION}"
+            f"/img/item/{item_id}.png")
+
+
+def _ensure_perk_map() -> None:
+    """加载 符文ID->图标URL 映射（带磁盘缓存，失败则跳过）。"""
+    if _PERK_ICON_URLS:
+        return
+    rows = _cache_read("perks", "map", "all", "v1")
+    if not rows:
+        try:
+            j = _session("cd").get(_PERKS_URL, timeout=15).json()
+            rows = [{"id": p["id"], "path": p["iconPath"]} for p in j]
+            _cache_write("perks", "map", "all", "v1", rows)
+        except Exception:
+            rows = []
+    for r in rows:
+        p = r["path"].replace("/lol-game-data/assets/", "")
+        _PERK_ICON_URLS[int(r["id"])] = _CD_BASE + p.lower()
+
+
+def _perk_url(perk_id: int) -> str:
+    _ensure_perk_map()
+    return _PERK_ICON_URLS.get(int(perk_id), "")
+
+
+def _shard_url(shard_id) -> str:
+    """属性碎片(50xx)图标：与符文共用 Community Dragon 映射。"""
+    return _perk_url(int(shard_id))
+
+
+def _ensure_summoner_map() -> None:
+    """加载 召唤师技能数字ID->图标文件名 映射。"""
+    if _SUMMONER_ICON:
+        return
+    rows = _cache_read("summon", "map", "all", "v1")
+    if not rows:
+        try:
+            j = _session("cd").get(_SUMMONER_URL, timeout=15).json()["data"]
+            rows = [{"key": v["key"], "id": v["id"]} for v in j.values()]
+            _cache_write("summon", "map", "all", "v1", rows)
+        except Exception:
+            rows = []
+    for r in rows:
+        _SUMMONER_ICON[str(r["key"])] = r["id"]
+
+
+def _summoner_url(spell_id) -> str:
+    _ensure_summoner_map()
+    name = _SUMMONER_ICON.get(str(spell_id))
+    if not name:
+        return ""
+    return (f"https://ddragon.leagueoflegends.com/cdn/{_DD_VERSION}"
+            f"/img/spell/{name}.png")
+
+
+def _ensure_boot_set() -> None:
+    """加载鞋类装备ID集合（Data Dragon item 数据中 tags 含 BOOTS）。"""
+    if _BOOT_IDS:
+        return
+    rows = _cache_read("boots", "map", "all", "v1")
+    if not rows:
+        try:
+            u = (f"https://ddragon.leagueoflegends.com/cdn/{_DD_VERSION}"
+                 "/data/en_US/item.json")
+            j = _session("cd").get(u, timeout=15).json()["data"]
+            rows = [int(k) for k, v in j.items()
+                    if "BOOTS" in [t.upper() for t in (v.get("tags") or [])]]
+            _cache_write("boots", "map", "all", "v1", rows)
+        except Exception:
+            rows = []
+    _BOOT_IDS.update(int(r) for r in rows)
+
+
+def _top_pick(rows: List[dict], key: str):
+    """从 [{pick_rate,...}] 中取选择率最高的一项（无 pick_rate 返回 None）。"""
+    if not rows:
+        return None
+    return max(rows, key=lambda x: x.get("pick_rate") or 0)
+
+
+def fetch_build(champion_id: int, slug: str, lane: str,
+                timeout: float = 12.0) -> Optional[BuildInfo]:
+    """抓取并解析某英雄某分路的通用符文出装（Blitz 页面预取的明文 JSON）。
+
+    slug 为 Blitz 使用的英雄标识（= Data Dragon 内部英雄 key 小写，
+    如悟空 monkeyking、蕾娜塔 renata），由调用方从 ChampionDB 取得。
+    """
+    url = f"https://blitz.gg/lol/champions/{slug}/build?lane={lane}"
+    r = _session("blitz").get(url, timeout=timeout)
+    if r.status_code != 200:
+        return None
+    m = re.search(
+        r'<script type="application/json" data-sveltekit-fetched[^>]*'
+        r'data-url="[^"]*champion_builds_tags[^"]*"[^>]*>(.*?)</script>',
+        r.text, re.S)
+    if not m:
+        return None
+    wrap = json.loads(m.group(1))
+    rows = json.loads(wrap["body"]).get("data", [])
+    if not rows:
+        return None
+    # Blitz 通常按热度返回几套 build，取对局样本最多的一套作为主流推荐
+    s = max(rows, key=lambda x: x.get("games") or 0)
+
+    # 基石符文
+    ks = _top_pick(s.get("keystone") or [], "keystone_id")
+    keystone_id = int(ks["keystone_id"]) if ks else 0
+    # 小符文：按 index(槽位) 取每槽最热，排除基石槽(index=0)
+    by_index: dict[int, list] = {}
+    for rn in s.get("runes") or []:
+        by_index.setdefault(rn.get("index", 0), []).append(rn)
+    small = []
+    for idx in sorted(by_index):
+        if idx == 0:
+            continue
+        top = _top_pick(by_index[idx], "runeId")
+        if top:
+            rid = int(top["runeId"])
+            small.append({"id": rid, "url": _perk_url(rid),
+                          "tree": top.get("treeId", 0)})
+    # 碎片（3个：进攻/灵活/防御）
+    shard_urls: List[str] = []
+    for shard_key in ["offenseShard", "flexShard", "defenseShard"]:
+        top = _top_pick((s.get("shards") or {}).get(shard_key) or [], "shard_id")
+        if top:
+            shard_urls.append(_shard_url(top["shard_id"]))
+    # 召唤师技能
+    sum_top = _top_pick(s.get("summonerSpells") or [], "summonerSpellIds")
+    summoner_urls = []
+    if sum_top:
+        summoner_urls = [_summoner_url(i) for i in sum_top["summonerSpellIds"]]
+    # 出门装（itemIds 为字符串ID列表；2003=生命药水、3340=视野守卫，均不单独展示）
+    _HIDE_START = {"2003", "3340"}
+    start_top = _top_pick(s.get("startingItems") or [], "itemIds")
+    start_urls = []
+    if start_top:
+        start_urls = [_item_url(i) for i in start_top["itemIds"]
+                      if str(i) not in _HIDE_START]
+    # 核心装（Blitz 的 coreItems 有时本身含鞋；鞋要单独展示，先分离出来）
+    _ensure_boot_set()
+    core_top = _top_pick(s.get("coreItems") or [], "itemIds")
+    core_urls = []
+    core_boot_id = 0
+    if core_top:
+        core_raw = [int(x) for x in str(core_top["itemIds"]).split(",") if x]
+        for i in core_raw:
+            if i in _BOOT_IDS and not core_boot_id:
+                core_boot_id = i
+            else:
+                core_urls.append(_item_url(i))
+    # 鞋子：优先核心装里的鞋，否则从情境装备选选择率最高的一双
+    boot_id = core_boot_id
+    boot_score = -1.0
+    for sit in s.get("situationalItems") or []:
+        iid = int(sit.get("itemId", 0))
+        if iid in _BOOT_IDS:
+            score = sit.get("games", 0)
+            if score > boot_score:
+                boot_id, boot_score = iid, score
+    boots = _item_url(boot_id) if boot_id else ""
+    # 技能加点：取最热 skillOrder 的前5级
+    skill = _top_pick(s.get("skillOrders") or [], "skillOrder")
+    skill5 = []
+    if skill:
+        skill5 = [["Q", "W", "E", "R"][i - 1]
+                  for i in skill["skillOrder"][:5] if 1 <= i <= 4]
+
+    # win_rate 源是 0~1 的比例，统一归一到百分数；个别来源可能已给 0~100
+    wr_raw = float(s.get("win_rate") or 0.0)
+    win_rate_pct = wr_raw * 100.0 if wr_raw <= 1.0 else wr_raw
+    return BuildInfo(
+        champion_id=champion_id, lane=lane, patch=str(s.get("patch", "")),
+        keystone_id=keystone_id, keystone_url=_perk_url(keystone_id),
+        runes=small, shards=shard_urls, summoner=summoner_urls,
+        start_items=start_urls, core_items=core_urls, boots_url=boots,
+        skill_order=skill5, games=int(s.get("games") or 0),
+        win_rate=win_rate_pct)
+
+
 class Recommender:
     def __init__(self, db: ChampionDB, providers: List[str], timeout: float = 12.0,
-                 top_n: int = 8):
+                 top_n: int = 8, tier: str = "emerald_plus"):
         self.db = db
         self.providers = providers
         self.timeout = timeout
         self.top_n = top_n
+        # 段位筛选：UI 切换时直接改此属性并触发重查，无需重建 Recommender
+        self.tier = tier
 
     # ---------- 离线秒出（无网络等待） ----------
     def recommend_offline(self, enemy_id: int, lane: str) -> tuple[List[Counter], str]:
@@ -246,13 +502,61 @@ class Recommender:
         for name in ("lola", "blitz"):
             if name_map[name] not in self.providers:
                 continue
-            rows = _cache_read(name, info["slug"], ql)
+            rows = _cache_read(name, info["slug"], ql, self.tier)
             if rows:
                 src = "lolalytics" if name == "lola" else "blitz"
                 recs = self._build_counters(enemy_id, ql, rows, src)
                 if recs:
                     return recs, src
         return [], ""
+
+    # ---------- 通用符文 / 出装 ----------
+    @staticmethod
+    def _build_to_dict(b: BuildInfo) -> dict:
+        return {k: getattr(b, k) for k in [
+            "champion_id", "lane", "patch", "keystone_id", "keystone_url",
+            "runes", "shards", "summoner", "start_items", "core_items",
+            "boots_url", "skill_order", "games", "win_rate"]}
+
+    @staticmethod
+    def _build_from_dict(d: dict) -> BuildInfo:
+        data = {k: d.get(k) for k in [
+            "champion_id", "lane", "patch", "keystone_id", "keystone_url",
+            "runes", "shards", "summoner", "start_items", "core_items",
+            "boots_url", "skill_order", "games", "win_rate"]}
+        # 兼容旧缓存：win_rate 可能是 0~1 比例
+        wr = data.get("win_rate") or 0.0
+        if wr <= 1.0:
+            data["win_rate"] = wr * 100.0
+        # 兼容旧缓存：核心装里若混进了鞋子，去掉以免和单独的鞋重复
+        bu = data.get("boots_url")
+        if bu and data.get("core_items"):
+            data["core_items"] = [u for u in data["core_items"] if u != bu]
+        return BuildInfo(**data)
+
+    def build_cached(self, champion_id: int, lane: str) -> Optional[BuildInfo]:
+        """只用磁盘缓存返回符文出装（未命中返回 None，不发网络请求）。"""
+        info = self.db.by_champion_id(champion_id)
+        if not info:
+            return None
+        ql = lane or "top"
+        rows = _cache_read("build", info["slug"], ql, "v1")
+        if rows:
+            return self._build_from_dict(rows)
+        return None
+
+    def build_fetch(self, champion_id: int, lane: str) -> Optional[BuildInfo]:
+        """在线抓取符文出装并写缓存（失败返回 None）。"""
+        info = self.db.by_champion_id(champion_id)
+        if not info:
+            return None
+        ql = lane or "top"
+        b = fetch_build(champion_id, info["slug"], ql, self.timeout)
+        if b and b.keystone_id:
+            _cache_write("build", info["slug"], ql, "v1",
+                         self._build_to_dict(b))
+            return b
+        return None
 
     def recommend(self, enemy_id: int, lane: str) -> tuple[List[Counter], str]:
         """同步推荐：在线源竞速（超时即降级），适合 CLI。GUI 请用异步接口。"""
@@ -277,6 +581,9 @@ class Recommender:
         """
         import threading
 
+        # 捕获本次请求的段位：防止请求途中 UI 切换段位导致读写错位
+        tier = self.tier
+
         def work():
             info = self.db.by_champion_id(enemy_id)
             if not info:
@@ -288,26 +595,26 @@ class Recommender:
 
             def try_lola():
                 try:
-                    cached = _cache_read("lola", slug, ql)
+                    cached = _cache_read("lola", slug, ql, tier)
                     if cached is not None:
                         box["lola"] = cached
                         return
-                    rows = fetch_lolalytics(slug, ql, quick_timeout or self.timeout)
+                    rows = fetch_lolalytics(slug, ql, quick_timeout or self.timeout, tier)
                     if rows:
-                        _cache_write("lola", slug, ql, rows)
+                        _cache_write("lola", slug, ql, tier, rows)
                         box["lola"] = rows
                 except Exception:
                     pass
 
             def try_blitz():
                 try:
-                    cached = _cache_read("blitz", slug, ql)
+                    cached = _cache_read("blitz", slug, ql, tier)
                     if cached is not None:
                         box["blitz"] = cached
                         return
-                    rows = fetch_blitz(slug, ql, quick_timeout or self.timeout)
+                    rows = fetch_blitz(slug, ql, quick_timeout or self.timeout, tier)
                     if rows:
-                        _cache_write("blitz", slug, ql, rows)
+                        _cache_write("blitz", slug, ql, tier, rows)
                         box["blitz"] = rows
                 except Exception:
                     pass

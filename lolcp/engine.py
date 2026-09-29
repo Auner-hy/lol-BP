@@ -21,6 +21,18 @@ from .matchup import Recommender, Counter
 LANE_CN = {"top": "上单", "jungle": "打野", "middle": "中单",
            "bottom": "下路", "support": "辅助", "": "未定"}
 
+# 各数据源分路叫法不同：LCU 选将用 utility、个别接口用 mid/bot/jg 等
+_LANE_ALIAS = {"utility": "support", "sup": "support", "mid": "middle",
+               "jg": "jungle", "jungler": "jungle", "adc": "bottom",
+               "bot": "bottom"}
+
+
+def norm_lane(lane: str) -> str:
+    """把任意来源的分路叫法归一到内部标准 key。"""
+    if not lane:
+        return ""
+    return _LANE_ALIAS.get(lane.lower(), lane.lower())
+
 
 @dataclass
 class EnemyChamp:
@@ -36,7 +48,8 @@ class Snapshot:
     phase_cn: str = "未检测到客户端"
     my_lane: str = ""
     my_champ_id: int = 0
-    enemies: List[EnemyChamp] = field(default_factory=list)   # 可选的敌方英雄
+    allies: List[EnemyChamp] = field(default_factory=list)     # 我方全部英雄（含自己）
+    enemies: List[EnemyChamp] = field(default_factory=list)   # 敌方全部英雄
     auto_enemy_id: int = 0            # 系统判定的对位英雄（同路敌人）
     bans: List[int] = field(default_factory=list)
     mode: str = ""
@@ -51,7 +64,7 @@ class Engine:
         self.live = LiveClient(timeout=4.0)
         self.recommender = Recommender(
             self.db, providers=config.data_providers,
-            timeout=config.http_timeout, top_n=config.top_n)
+            timeout=config.http_timeout, top_n=config.top_n, tier=config.tier)
         self.manual_enemy_id: int = 0   # 用户在界面手动点选的敌方英雄
 
     # ---------- 本地状态轮询（无外网） ----------
@@ -88,14 +101,23 @@ class Engine:
     def _snapshot_from_champ_select(self, snap: Snapshot, cs) -> Snapshot:
         snap.phase = "champ_select"
         snap.phase_cn = "选将阶段（BP）"
-        snap.my_lane = cs.my_position
+        snap.my_lane = norm_lane(cs.my_position)
         snap.my_champ_id = cs.my_champion_id
         snap.bans = list(cs.banned_champion_ids)
+        for p in cs.allies:
+            if not p.champion_id:
+                continue
+            snap.allies.append(EnemyChamp(
+                champion_id=p.champion_id,
+                lane=norm_lane(p.position),
+                lane_cn=LANE_CN.get(norm_lane(p.position), ""),
+                name=self.db.name_of(p.champion_id),
+            ))
         for p in cs.locked_enemies():
             snap.enemies.append(EnemyChamp(
                 champion_id=p.champion_id,
-                lane=p.position,
-                lane_cn=LANE_CN.get(p.position, ""),
+                lane=norm_lane(p.position),
+                lane_cn=LANE_CN.get(norm_lane(p.position), ""),
                 name=self.db.name_of(p.champion_id),
             ))
         lane_enemy = cs.enemy_in_my_lane()
@@ -110,15 +132,27 @@ class Engine:
         snap.phase = "in_game"
         snap.phase_cn = "游戏进行中"
         snap.mode = game.mode
-        snap.my_lane = game.my_position
+        snap.my_lane = norm_lane(game.my_position)
+        for p in game.players:
+            if p.team != game.my_team:
+                continue
+            cid = self.db.id_by_en(p.champion_name) or self.db.id_by_en(p.display_name)
+            if not cid:
+                continue
+            snap.allies.append(EnemyChamp(
+                champion_id=cid,
+                lane=norm_lane(p.position),
+                lane_cn=LANE_CN.get(norm_lane(p.position), ""),
+                name=self.db.name_of(cid),
+            ))
         for p in game.enemies():
             cid = self.db.id_by_en(p.champion_name) or self.db.id_by_en(p.display_name)
             if not cid:
                 continue
             snap.enemies.append(EnemyChamp(
                 champion_id=cid,
-                lane=p.position,
-                lane_cn=LANE_CN.get(p.position, ""),
+                lane=norm_lane(p.position),
+                lane_cn=LANE_CN.get(norm_lane(p.position), ""),
                 name=self.db.name_of(cid),
             ))
         lane_enemy = game.enemy_in_my_lane()
@@ -134,6 +168,22 @@ class Engine:
         return snap
 
     # ---------- 推荐（可能走外网，在后台线程调用） ----------
+    def lane_matchups(self, snap: Snapshot) -> List[Tuple[str, EnemyChamp, EnemyChamp]]:
+        """按分路把双方英雄配成 5 对。返回 [(lane, ally, enemy), ...]，
+        缺人的一侧为 None。仅用快照数据，不发网络请求。"""
+        # 数据进入快照时已归一，这里再兜一层防止异常来源
+        a_by, e_by = {}, {}
+        for a in snap.allies:
+            if a.lane:
+                a_by.setdefault(norm_lane(a.lane), a)
+        for e in snap.enemies:
+            if e.lane:
+                e_by.setdefault(norm_lane(e.lane), e)
+        out = []
+        for ln in ("top", "jungle", "middle", "bottom", "support"):
+            out.append((ln, a_by.get(ln), e_by.get(ln)))
+        return out
+
     def target_enemy(self, snap: Snapshot) -> int:
         return self.manual_enemy_id or snap.auto_enemy_id
 
