@@ -199,6 +199,8 @@ class CounterPickerApp:
 
         self._setup_style()
         self._build_ui()
+        # 英雄库本地缓存秒开后，后台静默检查是否有新版本
+        self.engine.db.refresh_async()
         # 段位下拉初值：与配置一致
         for i, (_, t) in enumerate(self.TIER_OPTS):
             if t == self.cfg.tier:

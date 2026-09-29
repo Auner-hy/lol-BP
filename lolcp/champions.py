@@ -108,22 +108,60 @@ class ChampionDB:
             return
         cache = CACHE_DIR / f"champions_{self.lang}.json"
         data = None
-        try:
-            versions = requests.get(DDRAGON_VERSIONS, timeout=self.timeout).json()
-            self.version = versions[0]
-            url = DDRAGON_CHAMPIONS.format(version=self.version, lang=self.lang)
-            data = requests.get(url, timeout=self.timeout).json()["data"]
-            cache.write_text(json.dumps({"version": self.version, "data": data}, ensure_ascii=False),
-                             encoding="utf-8")
-        except Exception:
-            # 离线兜底：用缓存或内置表
-            if cache.exists():
-                try:
-                    cached = json.loads(cache.read_text(encoding="utf-8"))
-                    self.version = cached.get("version")
-                    data = cached.get("data")
-                except Exception:
-                    data = None
+
+        # 缓存优先：本地已有英雄库就立即使用（毫秒级），
+        # 版本更新交给后台 refresh_async() 静默完成，不阻塞启动。
+        if cache.exists():
+            try:
+                cached = json.loads(cache.read_text(encoding="utf-8"))
+                self.version = cached.get("version")
+                data = cached.get("data")
+            except Exception:
+                data = None
+
+        # 仅当完全没有本地缓存（首次运行）时，才联网拉取一次。
+        if not data:
+            try:
+                versions = requests.get(DDRAGON_VERSIONS, timeout=self.timeout).json()
+                self.version = versions[0]
+                url = DDRAGON_CHAMPIONS.format(version=self.version, lang=self.lang)
+                data = requests.get(url, timeout=self.timeout).json()["data"]
+                cache.write_text(
+                    json.dumps({"version": self.version, "data": data},
+                               ensure_ascii=False),
+                    encoding="utf-8")
+            except Exception:
+                data = None
+
+        self._fill(data)
+        self._loaded = True
+
+    def refresh_async(self) -> None:
+        """后台静默检查英雄库是否有新版本；有则更新缓存，下次启动生效。
+
+        英雄库是跨大版本才变动的静态数据，无需阻塞 UI。
+        """
+        import threading
+
+        def _work():
+            try:
+                cache = CACHE_DIR / f"champions_{self.lang}.json"
+                versions = requests.get(DDRAGON_VERSIONS, timeout=self.timeout).json()
+                latest = versions[0]
+                if latest == self.version:
+                    return
+                url = DDRAGON_CHAMPIONS.format(version=latest, lang=self.lang)
+                new_data = requests.get(url, timeout=self.timeout).json()["data"]
+                cache.write_text(
+                    json.dumps({"version": latest, "data": new_data},
+                               ensure_ascii=False),
+                    encoding="utf-8")
+            except Exception:
+                pass
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _fill(self, data) -> None:
         if data:
             for key, info in data.items():
                 cid = int(info["key"])
@@ -151,7 +189,6 @@ class ChampionDB:
                 old = self.by_id[cid].get("alias", "")
                 merged = " ".join(dict.fromkeys([old, alias])) if old else alias
                 self.by_id[cid]["alias"] = merged.strip()
-        self._loaded = True
 
     def display_name(self, cid: int) -> str:
         info = self.by_champion_id(cid)
