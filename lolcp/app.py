@@ -22,6 +22,7 @@ import requests
 
 from .config import Config, CACHE_DIR
 from .engine import Engine, LANE_CN
+from . import __version__
 
 try:
     from PIL import Image, ImageTk  # 高清缩放（Pillow），缺失时自动降级
@@ -187,7 +188,7 @@ class CounterPickerApp:
         except Exception:
             pass
 
-        self.root.title("LOL 对位 Counter 助手")
+        self.root.title(f"LOL 对位 Counter 助手  v{__version__}")
         self.root.configure(bg=BG)
         self.root.geometry(f"{sp(1000)}x{sp(640)}")
         self.root.minsize(sp(860), sp(560))
@@ -248,7 +249,7 @@ class CounterPickerApp:
         self.lbl_status = tk.Label(header, text="正在启动…", bg=BG, fg=TEXT,
                                    font=fnt(10, "bold"))
         self.lbl_status.pack(side="left")
-        tk.Label(header, text="LOL COUNTER", bg=BG, fg=GOLD_DIM,
+        tk.Label(header, text=f"LOL COUNTER  v{__version__}", bg=BG, fg=GOLD_DIM,
                  font=fnt(9, "bold")).pack(side="right")
 
         # ===== 顶部按钮行 =====
