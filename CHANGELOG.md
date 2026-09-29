@@ -13,7 +13,9 @@
 
 ---
 
-## [1.3.0] — 2026-09-29
+## [1.3.0-beta] — 2026-09-29
+
+> ⚠️ **测试版（beta）**：本版本尚未完成实测，可能存在未发现的问题，确认稳定后会摘除 beta 标记。
 
 > 主题：新增"阵容推荐"——看双方整体阵容给建议，不再只看单一对位。
 
@@ -205,7 +207,7 @@
 
 ---
 
-[1.3.0]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.3.0
+[1.3.0-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.3.0
 [1.2.0]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.2.0
 [1.1.2]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.1.2
 [1.1.1]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.1.1
