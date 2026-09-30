@@ -13,6 +13,25 @@
 
 ---
 
+## [1.4.1-beta] - 2026-09-30 · 测试版（待实测）
+
+### 修复
+- **修复部分启动方式下程序无法启动、弹窗报错
+  `Security validation failure: failed to obtain executable path for parent process!` 的问题。**
+  - 根因：PyInstaller（打包工具）v6.22.1 起在 onefile 单文件引导程序中加入“父进程
+  安全校验”，v6.22.2 中该校验对普通（未提权）程序也会执行；当 exe 从浏览器下载
+  弹窗的“打开/运行”、部分下载器 / 压缩包等非常规方式启动时，引导程序拿不到父进程
+  可执行路径，于是校验失败并退出，主界面无法启动。
+  - 修复：将打包工具升级到 **PyInstaller 6.22.3**——官方已把该父进程校验限制为
+  “仅 UAC 提权进程”，普通双击与浏览器启动不再触发，本版重新打包即解决。
+
+### 说明
+- 本版仍为 **beta**，待完成实测确认该问题不再复现后摘除。
+- 仍建议把 exe 保存到本地文件夹后运行；自动更新功能不受影响。
+
+---
+
+
 ## [1.4.0-beta] - 2026-09-30 · 测试版（待实测）
 
 ### 新增
@@ -225,6 +244,7 @@
 
 ---
 
+[1.4.1-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.4.1
 [1.4.0-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.4.0
 [1.3.0-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.3.0
 [1.2.0]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.2.0
