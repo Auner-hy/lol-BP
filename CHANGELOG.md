@@ -13,6 +13,29 @@
 
 ---
 
+## [1.4.3-beta] - 2026-09-30 · 测试版（待实测）
+
+### 修复
+- **修复通过应用内“立即更新”升级后，新版本启动报错
+  `Failed to load Python DLL '…\Temp\_MEIxxxxxx\python313.dll'.
+  LoadLibrary: 找不到指定的模块。` 的问题。**
+  - 根因：这是 PyInstaller 单文件（onefile）模式自更新的典型**时序竞争**。
+    更新批处理刚把新 exe 覆盖写入就立刻启动它，此时 Windows Defender / 杀毒软件的
+    实时防护正在扫描这个“新诞生”的文件；onefile 一边把运行库解压到临时目录、
+    安全软件一边扫描锁定，可能在解压中途锁定 `vcruntime140.dll` 等依赖，
+    导致 DLL 链断裂（报错里的 python313.dll 其实存在，是它依赖的 DLL 没加载到）。
+  - 修复一：覆盖成功后先用 `type` 读一遍新 exe（**预热**），强制安全软件完成同步扫描，
+    再等待约 3 秒让文件系统与扫描稳定，然后才启动新版本，从根本上避开该竞争。
+  - 修复二：下载环节新增**完整性校验**——文件大小须与 GitHub 声明一致、文件头须为
+    Windows 可执行文件、且在 GitHub 提供 SHA256 时哈希必须完全一致，任一不符都拒绝落地，
+    避免在代理 / 网络环境下下载被截断却仍被安装。
+
+### 说明
+- 本版仍为 **beta**，待实测确认自动更新链路稳定后摘除。
+- 对 1.4.2 用户：可直接在应用内更新到本版；若仍遇到启动报错，到 Release 页面手动下载覆盖即可。
+
+---
+
 ## [1.4.2-beta] - 2026-09-30 · 测试版（待实测）
 
 ### 修复
@@ -262,6 +285,7 @@
 
 ---
 
+[1.4.3-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.4.3
 [1.4.2-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.4.2
 [1.4.1-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.4.1
 [1.4.0-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.4.0

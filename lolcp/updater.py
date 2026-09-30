@@ -43,6 +43,7 @@ class UpdateInfo:
     release_url: str = ""   # GitHub Release 页面地址（手动下载兜底用）
     prerelease: bool = False  # 是否为测试版（预发布）
     size: int = 0           # 下载文件字节数（未知时为 0）
+    expected_sha256: str = ""  # GitHub 资产官方 SHA256（下载完整性校验用）
 
 
 # ============================ 版本号比较 ============================
@@ -109,6 +110,8 @@ def _release_from_json(item: dict) -> UpdateInfo | None:
         release_url=str(item.get("html_url", "") or ""),
         prerelease=bool(item.get("prerelease", False)),
         size=int(asset.get("size", 0) or 0),
+        # GitHub 新版 API 直接给出资产 SHA256（形如 "sha256:xxxx"），去掉前缀
+        expected_sha256=str(asset.get("digest", "") or "").split(":")[-1].strip().lower(),
     )
 
 
@@ -151,12 +154,25 @@ def check_for_update(current_version: str, include_beta: bool = True,
 
 
 # ============================ 下载 ============================
+def _sha256_of(path: Path) -> str:
+    """计算文件 SHA256（分块读取，避免大文件一次性进内存）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def download(info: UpdateInfo, dest: Path,
              on_progress=None, timeout: float = 60.0) -> Path | None:
     """流式下载新 exe 到 dest。
 
     on_progress(已下载字节, 总字节) 用于更新进度条。
-    下载完成后做基本校验（是 Windows 可执行文件且非空），失败返回 None。
+    下载完成后做校验：
+      1) 文件大小与 GitHub 声明一致（已知大小时）；
+      2) 文件头是 Windows PE 可执行文件（MZ）；
+      3) 若 GitHub 给出了官方 SHA256，则必须完全一致。
+    任一不过返回 None，绝不落地启动。
     """
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -174,16 +190,25 @@ def download(info: UpdateInfo, dest: Path,
                     done += len(chunk)
                     if on_progress:
                         on_progress(done, total)
-        # 完整性校验：文件存在、大于 1MB、且文件头是 Windows PE 可执行文件（MZ）
-        if not tmp.exists() or tmp.stat().st_size < 1024 * 1024:
+        # 校验一：文件存在、大于 5MB（真实构建约 14MB，可挡住截断的半成品）
+        if not tmp.exists() or tmp.stat().st_size < 5 * 1024 * 1024:
             tmp.unlink(missing_ok=True)
             return None
+        # 校验二：文件头是 Windows PE 可执行文件（MZ）
         with open(tmp, "rb") as f:
             head = f.read(2)
         if head != b"MZ":
             tmp.unlink(missing_ok=True)
             return None
-        # 校验通过，落地为正式文件名
+        # 校验三：大小与官方声明一致（已知时），不一致说明在代理/网络下被截断
+        if info.size and tmp.stat().st_size != info.size:
+            tmp.unlink(missing_ok=True)
+            return None
+        # 校验四：官方 SHA256 必须一致（最严格的完整性校验）
+        if info.expected_sha256 and _sha256_of(tmp) != info.expected_sha256:
+            tmp.unlink(missing_ok=True)
+            return None
+        # 全部通过，落地为正式文件名
         if dest.exists():
             dest.unlink()
         tmp.replace(dest)
@@ -225,7 +250,13 @@ def install_and_restart(downloaded: Path) -> bool:
 
     # 思路：主程序启动本脚本后会立即退出。脚本循环尝试覆盖 exe，
     # 程序还没完全关闭时复制会失败，重试即可（每次等约 1 秒，最多约 30 秒）；
-    # 成功后启动新 exe、删除下载文件，最后自删除本脚本。
+    # 成功后【先预热 + 等待】再启动新 exe，最后删除下载文件并自删除。
+    #
+    # 为什么要预热：刚覆盖写入的新 exe 会立刻触发 Windows Defender / 杀毒软件
+    # 的实时扫描；若此刻马上启动，onefile 模式一边解压 DLL 到临时目录、杀软
+    # 一边扫描锁定，可能在中途锁定/隔离 vcruntime140.dll 等，导致新程序报
+    # "Failed to load Python DLL"。先用 type 读一遍可强制杀软同步扫描完，
+    # 再 sleep 等文件系统与扫描都稳定，规避这个时序竞争（业界通用做法）。
     bat = (
         "@echo off\r\n"
         "chcp 65001 >nul\r\n"
@@ -241,6 +272,10 @@ def install_and_restart(downloaded: Path) -> bool:
         "ping -n 2 127.0.0.1 >nul\r\n"
         "goto retry\r\n"
         ":ok\r\n"
+        "rem ---- 预热新 exe：强制安全软件同步扫描一遍 ----\r\n"
+        'type "%DST%" >nul 2>nul\r\n'
+        "rem ---- 等待约 3 秒，让文件系统与实时扫描稳定 ----\r\n"
+        "ping -n 4 127.0.0.1 >nul\r\n"
         'start "" "%DST%"\r\n'
         'del /f /q "%SRC%" >nul 2>nul\r\n'
         ":end\r\n"
