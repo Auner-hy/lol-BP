@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import queue
+import os
 import threading
 import time
 import tkinter as tk
@@ -23,6 +24,8 @@ import requests
 from .config import Config, CACHE_DIR
 from .engine import Engine, LANE_CN
 from . import teamcomp
+from . import updater as updater_mod
+import webbrowser
 from . import __version__
 
 try:
@@ -173,6 +176,11 @@ class CounterPickerApp:
         # 阵容推荐（teamcomp）
         self._tc = None             # 最近一次 TeamCompResult（None=尚未分析）
         self._tc_widgets = []       # 阵容推荐卡片内动态控件，重绘前统一销毁
+
+        # 自动更新（updater）
+        self._upd_info = None       # 检测到的 UpdateInfo（None=无新版本）
+        self._upd_downloading = False  # 是否正在下载更新
+        self._upd_checked = False   # 本局是否已做过启动静默检测
         # 符文出装
         self._build_info = None       # 当前 BuildInfo（None=未加载）
         self._build_dirty = True      # 数据更新后、build页是否需要重渲染
@@ -265,6 +273,7 @@ class CounterPickerApp:
 
         # ===== 顶部按钮行 =====
         btns = tk.Frame(self.root, bg=BG)
+        self.button_frame = btns
         btns.pack(fill="x", padx=sp(14), pady=(sp(2), sp(6)))
         self.btn_auto = self._mk_button(btns, "↩ 恢复自动识别", self._clear_manual, GOLD_DIM)
         self.btn_auto.pack(side="left")
@@ -277,6 +286,9 @@ class CounterPickerApp:
             font=fnt(9), width=8)
         self.combo_tier.pack(side="left")
         self.combo_tier.bind("<<ComboboxSelected>>", self._on_tier_change)
+        self.btn_check_upd = self._mk_button(btns, "⟳ 检查更新",
+                                             self._manual_check_update, TEAL)
+        self.btn_check_upd.pack(side="right", padx=sp(4))
         self.var_top = tk.BooleanVar(value=True)
         tk.Checkbutton(btns, text="窗口置顶", variable=self.var_top, bg=BG, fg=MUTED,
                        selectcolor=CARD, activebackground=BG, activeforeground=TEXT,
@@ -301,6 +313,27 @@ class CounterPickerApp:
                                   font=fnt(8), anchor="e")
         self.lbl_clock.pack(side="right")
         self._tick_clock()
+
+        # ===== 更新提示条（默认隐藏，检测到新版本时显示） =====
+        self.update_bar = tk.Frame(self.root, bg=CARD2,
+                                  highlightbackground=GOLD, highlightthickness=sp(1))
+        # 提示文字 / 版本说明（左）
+        self.lbl_upd = tk.Label(self.update_bar, text="", bg=CARD2, fg=GOLD,
+                               font=fnt(9, "bold"), anchor="w")
+        self.lbl_upd.pack(side="left", padx=sp(12), pady=sp(6))
+        # 进度条（下载时显示）
+        self.upd_prog = ttk.Progressbar(self.update_bar, length=sp(180),
+                                        maximum=100)
+        # 操作按钮（右）
+        self.btn_upd_ok = self._mk_button(self.update_bar, "⬇ 立即更新",
+                                         self._start_update, TEAL)
+        self.btn_upd_later = self._mk_button(self.update_bar, "稍后",
+                                            self._hide_update_bar, MUTED)
+        self.btn_upd_open = self._mk_button(self.update_bar, "打开下载页",
+                                           self._open_release_page, GOLD)
+        self.btn_upd_later.pack(side="right", padx=(0, sp(12)), pady=sp(4))
+        self.btn_upd_ok.pack(side="right", padx=sp(4), pady=sp(4))
+        self.btn_upd_open.pack(side="right", padx=sp(4), pady=sp(4))
 
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=sp(12), pady=(0, sp(4)))
@@ -478,6 +511,123 @@ class CounterPickerApp:
         """创建一个统一样式的卡片容器（深色底 + 细边框）。"""
         return tk.Frame(parent, bg=CARD, highlightbackground=BORDER,
                         highlightthickness=sp(1))
+
+    # ===================== 自动更新（updater） =====================
+    def check_update_async(self, *, manual=False):
+        """后台检测 GitHub 最新版。manual=True 表示用户手动点的“检查更新”，
+        无新版本时也会在底部给一句反馈；启动时的静默检测则只在有新版时打扰。"""
+        if self._upd_downloading:
+            return
+
+        def work():
+            info = updater_mod.check_for_update(__version__)
+            self.q.put(("update_check", (manual, info)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_check(self, payload):
+        manual, info = payload
+        if info is None:
+            if manual:
+                self._set_footer("当前已是最新版本 " + __version__)
+            return
+        self._upd_info = info
+        self._show_update_bar()
+
+    def _show_update_bar(self):
+        """展开顶部更新提示条"""
+        info = self._upd_info
+        if info is None:
+            return
+        self.lbl_upd.config(
+            text=f"✨ 发现新版本 {info.version}（当前 {__version__}）")
+        self.btn_upd_ok.pack(side="right", padx=sp(4), pady=sp(4))
+        self.btn_upd_later.pack(side="right", padx=(0, sp(12)), pady=sp(4))
+        self.btn_upd_open.pack_forget()
+        self.upd_prog.pack_forget()
+        # 放在整个窗口最顶部（按钮行之上）
+        self.update_bar.pack(fill="x", before=self.button_frame)
+
+    def _hide_update_bar(self):
+        self.update_bar.pack_forget()
+
+    def _open_release_page(self):
+        if self._upd_info:
+            webbrowser.open(self._upd_info.release_url)
+
+    def _start_update(self):
+        """点“立即更新”：源码模式直接打开 Release 页；exe 模式后台下载。"""
+        info = self._upd_info
+        if info is None:
+            return
+        if not updater_mod.is_frozen():
+            self._open_release_page()
+            return
+        if self._upd_downloading:
+            return
+        self._upd_downloading = True
+        self.lbl_upd.config(text=f"正在下载 {info.version} …")
+        self.btn_upd_ok.pack_forget()
+        self.btn_upd_later.pack_forget()
+        self.btn_upd_open.pack_forget()
+        self.upd_prog.pack(side="right", padx=sp(8), pady=sp(6))
+        self.upd_prog["value"] = 0
+
+        # 下载暂存到 exe 同级的 _updates 文件夹（批处理替换时路径最简单可靠）
+        from pathlib import Path
+        import sys as _sys
+        dest_dir = Path(_sys.executable).resolve().parent / "_updates"
+        dest = dest_dir / ("LOLCounterPicker_" + info.version.replace("-", "_") + ".exe")
+
+        def work():
+            def on_prog(done, total):
+                if total:
+                    self.q.put(("update_progress", int(done * 100 / total)))
+            path = updater_mod.download(info, dest, on_prog)
+            if path is None:
+                self.q.put(("update_fail", "download returned None"))
+            else:
+                self.q.put(("update_ready", path))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_progress(self, pct):
+        self.upd_prog["value"] = pct
+
+    def _on_update_ready(self, path):
+        self.lbl_upd.config(text="下载完成，即将关闭并安装…")
+        self.upd_prog["value"] = 100
+        self.root.update_idletasks()
+        # 稍等片刻让用户看到“完成”，再启动替换脚本并退出
+        self.root.after(700, lambda: self._apply_and_quit(path))
+
+    def _apply_and_quit(self, path):
+        ok = updater_mod.install_and_restart(path)
+        if ok:
+            try:
+                self.root.destroy()
+            finally:
+                os._exit(0)
+        else:
+            self._upd_downloading = False
+            self._set_footer("自动安装失败，请点“打开下载页”手动下载")
+            self.btn_upd_open.pack(side="right", padx=sp(4), pady=sp(4))
+            self.btn_upd_later.pack(side="right", padx=(0, sp(12)), pady=sp(4))
+
+    def _on_update_fail(self, err):
+        self._upd_downloading = False
+        self.lbl_upd.config(text="下载失败，可稍后重试或打开下载页")
+        self.upd_prog.pack_forget()
+        self.btn_upd_open.pack(side="right", padx=sp(4), pady=sp(4))
+        self.btn_upd_later.pack(side="right", padx=(0, sp(12)), pady=sp(4))
+        self.btn_upd_ok.pack(side="right", padx=sp(4), pady=sp(4))
+
+    def _manual_check_update(self):
+        if self._upd_info:
+            self._show_update_bar()
+            return
+        self._set_footer("正在检查更新…")
+        self.check_update_async(manual=True)
 
     def _mk_button(self, parent, text, cmd, color) -> tk.Label:
         """用 Label 手搓一个可点击按钮（含鼠标悬停高亮效果）。"""
@@ -775,6 +925,14 @@ class CounterPickerApp:
                 elif kind == "computing":
                     if not self._last_recs[0]:
                         self.lbl_hint.configure(text="正在分析对位数据…")
+                elif kind == "update_check":
+                    self._on_update_check(payload)
+                elif kind == "update_progress":
+                    self._on_update_progress(payload)
+                elif kind == "update_ready":
+                    self._on_update_ready(payload)
+                elif kind == "update_fail":
+                    self._on_update_fail(payload)
                 elif kind == "avatar_refresh":
                     # 新头像就绪：只更新对应头像，不销毁重建整个界面（无闪烁）
                     self._refresh_avatars(payload)
@@ -1556,4 +1714,6 @@ class CounterPickerApp:
 
     def run(self):
         """进入 Tkinter 主事件循环（阻塞，直到窗口关闭）。"""
+        # 启动约 2 秒后后台静默检测一次更新（不弹窗打扰，只有发现新版才提示）
+        self.root.after(2000, lambda: self.check_update_async(manual=False))
         self.root.mainloop()
