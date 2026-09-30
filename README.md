@@ -1,6 +1,6 @@
 # LOL 对位识别 & Counter 英雄推荐工具
 
-**当前版本：v1.4.4-beta（测试版，尚未完成实测）** ｜ 完整更新记录见 [CHANGELOG.md](CHANGELOG.md) ｜ [下载最新 exe](#下载免安装-exe推荐)
+**当前版本：v1.5.0-beta（测试版，尚未完成实测）** ｜ 完整更新记录见 [CHANGELOG.md](CHANGELOG.md) ｜ [下载最新 exe](#下载免安装-exe推荐)
 
 在英雄联盟 **BP 选将和游戏对局**过程中，自动识别对位（同路）敌方英雄，并结合
 全网对位胜率推荐克制英雄；预选阶段点击英雄头像还能提前给出 **Ban 人建议**；
@@ -45,14 +45,23 @@
   头像下载完只更新对应头像，右下角时钟独立刷新；
 - 点击切换目标时界面**立即响应**，头像后台并行下载、不阻塞界面。
 
-## 下载免安装 exe（推荐）
+## 下载免安装版（推荐）
 
 不需要 Python，直接到 **[GitHub Releases 页面](https://github.com/Auner-hy/lol-BP/releases)**
-下载最新版 `LOLCounterPicker.exe`，双击即可运行。
+下载最新版 `LOLCounterPicker.zip`：
 
-- 首次运行 Windows SmartScreen / 杀毒可能对未签名 exe 弹一次提示，
+1. 解压 zip，得到 `LOLCounterPicker` 文件夹；
+2. 进入文件夹，双击其中的 `LOLCounterPicker.exe` 运行。
+
+> 为什么从单个 exe 改成 zip 文件夹？v1.5.0 起改用文件夹模式打包，
+> 运行库直接放在程序目录、**不再往临时目录解压**，可彻底避免火绒等
+> 安全软件在启动时拦截 DLL（旧版偶发的 `Failed to load Python DLL` 即由此引起），
+> 启动也更快。请保持文件夹内文件完整、不要只把 exe 单独拖出来运行。
+
+- 首次运行 Windows SmartScreen / 杀毒可能对未签名程序弹一次提示，
   选「更多信息」→「仍要运行」即可（PyInstaller 打包程序的常见现象）；
-- 英雄库、对位数据、头像会在本机自动缓存，之后启动和刷新都很快。
+- 软件启动后会在后台自动预取全部常用英雄的对位数据，之后查询基本秒开；
+  数据在本机自动缓存，每 6 小时后台更新。
 
 ## 源码运行（Windows）
 
@@ -71,8 +80,8 @@
    - 也可用顶部搜索框输入任意英雄、选择分路提前查克制；
    - 双方选齐后自动跳到符文出装页。
 
-> 想自己重新打包 exe：在装有 Python 和 PyInstaller 的电脑上双击
-> `build_exe.bat`，产物 `LOLCounterPicker.exe` 直接生成在项目根目录。
+> 想自己重新打包：在装有 Python 和 PyInstaller 的电脑上双击
+> `build_exe.bat`，产物为 `dist/LOLCounterPicker/` 文件夹（文件夹模式）。
 
 ## 工作原理（全部只读，安全无注入）
 

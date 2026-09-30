@@ -579,11 +579,11 @@ class CounterPickerApp:
         self.upd_prog.pack(side="right", padx=sp(8), pady=sp(6))
         self.upd_prog["value"] = 0
 
-        # 下载暂存到 exe 同级的 _updates 文件夹（批处理替换时路径最简单可靠）
+        # 下载暂存到程序目录同级的 _updates 文件夹（onedir zip 模式）
         from pathlib import Path
         import sys as _sys
-        dest_dir = Path(_sys.executable).resolve().parent / "_updates"
-        dest = dest_dir / ("LOLCounterPicker_" + info.version.replace("-", "_") + ".exe")
+        dest_dir = Path(_sys.executable).resolve().parent.parent / "_updates"
+        dest = dest_dir / "LOLCounterPicker.zip"
 
         def work():
             def on_prog(done, total):
@@ -608,7 +608,8 @@ class CounterPickerApp:
         self.root.after(700, lambda: self._apply_and_quit(path))
 
     def _apply_and_quit(self, path):
-        ok = updater_mod.install_and_restart(path)
+        info = self._upd_info
+        ok = updater_mod.install_and_restart(path, info.version if info else "")
         if ok:
             try:
                 self.root.destroy()
@@ -1806,4 +1807,67 @@ class CounterPickerApp:
         """进入 Tkinter 主事件循环（阻塞，直到窗口关闭）。"""
         # 启动约 2 秒后后台静默检测一次更新（不弹窗打扰，只有发现新版才提示）
         self.root.after(2000, lambda: self.check_update_async(manual=False))
+        # 新版本确认存活：通知更新脚本可以清理旧版本（非更新启动时为空操作）
+        self.root.after(3000, updater_mod.write_alive_stamp)
+        # 启动后后台全量预取对位数据（仅补齐本地缺失项），让之后查询秒开
+        self.root.after(2500, self.prefetch_all_async)
         self.root.mainloop()
+
+    # ===================== 全量数据预取（prefetch） =====================
+    def prefetch_all_async(self):
+        """后台线程池爬取全部常用「英雄×分路」对位数据，补齐本地缓存。
+
+        - 已在 6 小时有效期内的组合直接跳过，不重复请求；
+        - 用有上限的并发（6）请求，兼顾速度与对数据源的礼貌，避免被限流；
+        - 单个失败只跳过，绝不影响主程序；整轮跑完静默结束、不打扰用户。
+        这样用户点开任意英雄时基本都能命中本地缓存，毫秒出结果。
+        """
+        if getattr(self, "_prefetching", False):
+            return
+        self._prefetching = True
+
+        def work():
+            from concurrent.futures import ThreadPoolExecutor
+            from . import matchup as M_mod
+            from .lanes import CHAMPION_LANES
+            tier = self.engine.recommender.tier
+            try:
+                db = self.engine.db
+                ids = db.all_ids()
+                combos = []
+                for cid in ids:
+                    info = db.by_champion_id(cid)
+                    for lane in CHAMPION_LANES.get(info["en"], ()):
+                        combos.append((info["slug"], lane))
+
+                def fetch_one(item):
+                    slug, lane = item
+                    # 已有有效缓存（lola 或 blitz）则跳过
+                    if M_mod._cache_read("lola", slug, lane, tier) is not None:
+                        return True
+                    if M_mod._cache_read("blitz", slug, lane, tier) is not None:
+                        return True
+                    try:
+                        rows = M_mod.fetch_lolalytics(slug, lane, 8, tier)
+                        if rows:
+                            M_mod._cache_write("lola", slug, lane, tier, rows)
+                            return True
+                    except Exception:
+                        pass
+                    try:
+                        rows = M_mod.fetch_blitz(slug, lane, 8, tier)
+                        if rows:
+                            M_mod._cache_write("blitz", slug, lane, tier, rows)
+                            return True
+                    except Exception:
+                        pass
+                    return False
+
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    list(ex.map(fetch_one, combos))
+            except Exception:
+                pass
+            finally:
+                self._prefetching = False
+
+        threading.Thread(target=work, daemon=True).start()

@@ -23,8 +23,8 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/3] Building EXE with PyInstaller (takes 1-3 minutes) ...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name LOLCounterPicker --distpath . run_app.py
+echo [2/3] Building with PyInstaller in FOLDER mode (takes 1-3 minutes) ...
+python -m PyInstaller --noconfirm --clean --windowed --name LOLCounterPicker --exclude-module cryptography --exclude-module PIL --exclude-module numpy run_app.py
 if errorlevel 1 (
     echo [ERROR] PyInstaller build failed. Scroll up for details.
     pause
@@ -34,11 +34,12 @@ if errorlevel 1 (
 echo.
 echo [3/3] Done.
 echo ============================================================
-echo   EXE file : LOLCounterPicker.exe  (in this folder, test it first)
+echo   Output : dist\LOLCounterPicker\  (folder; run the exe inside)
 echo.
-echo   No local zip is created. To distribute, upload the exe as
-echo   an asset of the corresponding GitHub Release.
-echo   SmartScreen/antivirus may warn once (unsigned exe) -
+echo   FOLDER mode keeps runtime files on disk instead of extracting
+echo   to a temp dir, which avoids antivirus DLL-load errors.
+echo   To distribute, zip the folder and upload the zip as a Release asset.
+echo   SmartScreen/antivirus may warn once (unsigned) -
 echo   choose "More info" -^> "Run anyway".
 echo ============================================================
 pause

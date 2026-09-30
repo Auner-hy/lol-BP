@@ -31,4 +31,4 @@ def _setup_system_trust() -> None:
 
 _setup_system_trust()
 
-__version__ = "1.4.4-beta"
+__version__ = "1.5.0-beta"
