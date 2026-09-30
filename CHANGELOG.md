@@ -13,6 +13,24 @@
 
 ---
 
+## [1.4.2-beta] - 2026-09-30 · 测试版（待实测）
+
+### 修复
+- **修复在装有 HTTPS 网络加速 / 代理 / 杀毒软件的电脑上，程序无法联网的问题
+  （表现为在线胜率取不到、检查更新无响应、更新下载失败，报
+  `SSLCertVerificationError` / “证书验证失败”）。**
+  - 根因：部分本机软件（例如 SteamTools）会用自签根证书对 HTTPS 流量做“中间人”
+  解密。该根证书通常已装进 Windows 证书库（浏览器可以正常访问），但 Python 自带的
+  CA 证书包 certifi 里没有它，于是程序内联网请求因证书校验失败而中断。
+  - 修复：引入 **truststore** 库，程序启动最早期把 HTTPS 证书校验切换为直接使用
+  Windows 系统证书库，与浏览器行为保持一致；未安装该库时静默退回原有行为，不影响
+  没有这类软件的电脑。
+
+### 说明
+- 本版仍为 **beta**，待实测确认后摘除。
+
+---
+
 ## [1.4.1-beta] - 2026-09-30 · 测试版（待实测）
 
 ### 修复
@@ -244,6 +262,7 @@
 
 ---
 
+[1.4.2-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.4.2
 [1.4.1-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.4.1
 [1.4.0-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.4.0
 [1.3.0-beta]: https://github.com/Auner-hy/lol-BP/releases/tag/v1.3.0
