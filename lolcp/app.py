@@ -165,10 +165,14 @@ class CounterPickerApp:
         self._rec_key = None
         self._last_recs: tuple[list, str] = ([], "")
         self._rec_gen = 0
+        # 每个对位请求的在线拉取截止时间：超时未回包即不再等待，显示兜底/暂无
+        self._rec_deadlines: dict[tuple, float] = {}
+        self._rec_since: dict[tuple, float] = {}
         self._snap = None
         self._manual = False
         self._lane = ""
         self._online_pending = False  # 本轮是否正在等待在线数据（用于头像延后）
+        self._rec_timeout = False    # 在线超时：当前显示'暂无数据'而非'加载中'
         self._render_sig = None       # 推荐页上一次渲染的数据签名（相同则跳过重绘）
         self._avatar_slots = {}       # 头像原地刷新槽位：slot_key -> [label,cid,en,size,bg]
         self._ban_mode = False        # 当前榜单是否为"我方英雄受克制榜"（锁定Ban推荐）
@@ -187,6 +191,8 @@ class CounterPickerApp:
         self._build_cid = 0           # 当前 build 对应的英雄ID
         self._build_key = None        # 已加载 build 的 (英雄ID,分路)
         self._build_imgs = {}         # build 图标缓存 key -> PhotoImage
+        self._icon_slots = {}        # (url,size) -> [label,size,bg] 原地补图槽位
+        self._icon_missing: list[str] = []  # 本次渲染待后台下载的图标URL
         self._auto_switched = False   # 本局是否已自动跳转到符文出装页
         # 全路总览：阵容指纹 -> {lane: (ally_id, enemy_id, ally_winrate, src)}
         self._ov_fp = None
@@ -756,34 +762,46 @@ class CounterPickerApp:
                 self._ban_mode = ban_mode
                 key = (target, lane or "auto", ban_mode) if target else None
 
+                now = time.time()
+                resolved = None  # 本轮 worker 是否产出新对位结果
                 if target and key != self._rec_key:
                     self._rec_key = key
                     self._rec_gen += 1
                     gen = self._rec_gen
+                    self._rec_since[key] = now
+                    self._rec_deadlines[key] = now + 8.0  # 在线最多等 8 秒
                     # 1) 磁盘缓存优先：6 小时内看过同一对位直接秒出，不发网络
                     cached_recs, cached_src = self.engine.recommender.recommend_cached(
                         target, lane or "top")
                     if cached_recs:
-                        self._last_recs = (cached_recs, cached_src)
-                        self._online_pending = False
+                        resolved = (cached_recs, cached_src)
+                        self._rec_deadlines[key] = 0.0
                     else:
                         # 2) 无缓存：离线表立即出首帧（零等待）
                         off_recs, off_src = self.engine.recommender.recommend_offline(
                             target, lane or "top")
-                        self._last_recs = (off_recs, off_src) if off_recs else ([], "")
+                        if off_recs:
+                            resolved = (off_recs, off_src)
+                        else:
+                            # 离线也没有：下发 loading 占位，主界面先即时响应
+                            resolved = (None, "")
                         self.q.put(("computing", None))
-                        # 3) 在线更新：点击预选或锁定后立即拉取，拿到再原地替换
+                        # 3) 在线更新：拿到后由主线程回填到唯一显示状态
                         def on_online(recs, src, _gen=gen, _key=key):
                             if _gen == self._rec_gen and _key == self._rec_key:
                                 self.q.put(("recs_online", (recs, src)))
                         self.engine.recommender.recommend_async(
                             target, lane or "top", on_online=on_online,
                             quick_timeout=5.0)
-                        self._online_pending = True
-                elif not target:
+                elif target and key == self._rec_key:
+                    # 同一对位等待中：在线超时仍没回包，则结束 loading（不再无限转圈）
+                    if self._rec_deadlines.get(key, 0.0) and now >= self._rec_deadlines[key]:
+                        self._rec_deadlines[key] = 0.0
+                        if not self._last_recs[0]:
+                            resolved = (None, None)  # EMPTY_SENTINEL：显示'暂无数据'
+                if not target:
                     self._rec_key = None
                     self._last_recs = ([], "")
-                    self._online_pending = False
                     self._ban_mode = False
 
 
@@ -839,13 +857,13 @@ class CounterPickerApp:
                     info = self.engine.db.by_champion_id(target)
                     if info:
                         ens[target] = info["en"]
-                for c in self._last_recs[0]:
+                _show_recs = resolved if resolved is not None else self._last_recs
+                _disp_recs = _show_recs[0] if _show_recs and _show_recs[0] else []
+                for c in _disp_recs:
                     # ban 模式下跳过已被 ban 的英雄
                     if ban_mode and c.champion_id in snap.bans:
                         continue
-                    # 正在拉在线数据时跳过推荐头像：避免与排行榜请求抢带宽
-                    if not self._online_pending:
-                        ens[c.champion_id] = self.engine.db.en_of(c.champion_id)
+                    ens[c.champion_id] = self.engine.db.en_of(c.champion_id)
                 # 只保留本地缺失的头像，避免对已有文件做无谓判断
                 missing = {c: e for c, e in ens.items()
                            if not (_avatar_path(c).exists()
@@ -862,7 +880,10 @@ class CounterPickerApp:
                                     if not snap.my_champ_id else 0))
 
                 # state 先下发：界面先用占位块即时响应（点击不再等到下载完）
-                self.q.put(("state", (snap, self._last_recs, manual, lane, self._tc)))
+                # 显示用对位：本轮有新结果用新结果，否则沿用主界面当前显示，
+                # 绝不用 worker 的陈旧/空数据覆盖刚回来的在线结果
+                state_recs = resolved if resolved is not None else self._last_recs
+                self.q.put(("state", (snap, state_recs, manual, lane, self._tc)))
                 # 头像并行下载（最多4线程），全部完成后只做'原地刷新'，不重绘整页
                 if missing:
                     def _dl_all(_items=dict(missing)):
@@ -907,6 +928,13 @@ class CounterPickerApp:
                 kind, payload = self.q.get_nowait()
                 if kind == "state":
                     snap, recs, manual, lane, tc = payload
+                    # 规范化哨兵：recs[0]=None 表示'尚无结果'，统一转成空列表，
+                    # 用 source 是否为 None 区分'加载中'与'超时暂无数据'
+                    if recs and recs[0] is None:
+                        self._rec_timeout = recs[1] is None
+                        recs = ([], recs[1] if recs[1] is not None else "")
+                    else:
+                        self._rec_timeout = False
                     self._snap, self._last_recs = snap, recs
                     self._tc = tc
                     self._manual, self._lane = manual, lane
@@ -953,6 +981,8 @@ class CounterPickerApp:
                     self._build_key = None
                     self._build_dirty = True
                     self._reset_build_placeholder()
+                elif kind == "icons_ready":
+                    self._on_icons_ready(payload)
                 elif kind == "ov_show":
                     self._render_overview()
                 elif kind == "ov_hide":
@@ -1004,15 +1034,26 @@ class CounterPickerApp:
         except Exception:
             return None
 
+    @staticmethod
+    def _icon_cache_path(url: str):
+        """按 URL 哈希返回本地图标缓存路径（不联网）。"""
+        import hashlib
+        h = hashlib.md5(url.encode()).hexdigest()[:16]
+        for ext in (".png", ".webp"):
+            p = ICON_DIR / f"b_{h}{ext}"
+            if p.exists():
+                return p
+        return ICON_DIR / f"b_{h}.png"
+
     def _build_img(self, url: str, size: int):
-        """下载/取缓存 build 图标 URL -> PhotoImage（失败返回 None）。"""
+        """只读本地缓存把 build 图标转成 PhotoImage（绝不联网；未缓存返回 None）。"""
         if not url:
             return None
         ck = f"{url}@{size}"
         if ck in self._build_imgs:
             return self._build_imgs[ck]
-        p = self._fetch_url_image(url)
-        img = self._load_local_image(p, size) if p else None
+        p = self._icon_cache_path(url)
+        img = self._load_local_image(p, size) if p.exists() else None
         if img is not None:
             self._build_imgs[ck] = img
         return img
@@ -1039,6 +1080,9 @@ class CounterPickerApp:
         b = self._build_info
         if not b:
             return
+        # 本次渲染的图标槽位与待下载清单：渲染完统一后台预取
+        self._icon_slots = {}
+        self._icon_missing = []
         for col in (self.c_runes, self.c_items, self.c_skill):
             for w in col.winfo_children():
                 w.destroy()
@@ -1056,6 +1100,11 @@ class CounterPickerApp:
             else:
                 lbl.configure(image=self._placeholder(size, CARD2),
                               width=sp(size), height=sp(size))
+                # 登记槽位：后台下载完图标后原地补图，不重绘整页
+                if url:
+                    self._icon_slots[(url, size)] = [lbl, size, bg]
+                    if url not in self._icon_missing:
+                        self._icon_missing.append(url)
             return lbl
 
         def icon_row(parent, urls, size, gap=6):
@@ -1145,6 +1194,40 @@ class CounterPickerApp:
                 stat += f"\n{b.games:,} 场"
         self.lbl_build_stat.configure(text=stat, justify="right")
         self._build_dirty = False
+        # 后台预取本次缺失图标（不在主线程联网，避免窗口未响应）；下完原地补
+        if self._icon_missing:
+            urls = list(self._icon_missing)
+            def _prefetch(_urls=urls):
+                import concurrent.futures
+                def one(u):
+                    try:
+                        r = requests.get(u, timeout=8)
+                        if r.status_code == 200 and r.content:
+                            self._icon_cache_path(u).write_bytes(r.content)
+                            return u
+                    except Exception:
+                        return None
+                    return None
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+                    got = [x for x in ex.map(one, _urls) if x]
+                if got:
+                    self.q.put(("icons_ready", got))
+            threading.Thread(target=_prefetch, daemon=True).start()
+
+    def _on_icons_ready(self, urls):
+        """后台图标下载完成：把对应图标原地补到已登记的控件上（不整页重绘）。"""
+        wanted = set(urls)
+        for (url, size), slot in list(self._icon_slots.items()):
+            lbl, _sz, bg = slot
+            if url not in wanted:
+                continue
+            img = self._build_img(url, size)
+            if img:
+                try:
+                    lbl.configure(image=img, width=sp(size), height=sp(size))
+                    lbl.image = img
+                except tk.TclError:
+                    pass
 
     # ---------------- 渲染（原） ----------------
     def _render(self):
@@ -1351,12 +1434,19 @@ class CounterPickerApp:
             self.lbl_source.configure(text="")
             return
         if not recs:
-            self.lbl_hint.configure(
-                text="正在获取对位数据…\n（国内网络访问国际数据源较慢时，\n"
-                     "会自动切换到内置离线克制表）")
-            self.lbl_hint.pack(pady=sp(30))
-            self.lbl_source.configure(
-                text=source or "在线数据获取中…（通常 3～5 秒）")
+            if self._rec_timeout:
+                self.lbl_hint.configure(
+                    text="暂无该英雄在此分路的对位数据\n（可能是冷门分路，或网络访问超时）\n"
+                         "可稍后点「检查更新」旁的刷新，或换一个段位再试")
+                self.lbl_hint.pack(pady=sp(30))
+                self.lbl_source.configure(text="暂无在线数据（已等待约 8 秒）")
+            else:
+                self.lbl_hint.configure(
+                    text="正在获取对位数据…\n（国内网络访问国际数据源较慢时，\n"
+                         "会自动切换到内置离线克制表）")
+                self.lbl_hint.pack(pady=sp(30))
+                self.lbl_source.configure(
+                    text=source or "在线数据获取中…（通常 3～5 秒）")
             return
 
         rank_colors = {1: GOLD, 2: "#C0C0C0", 3: "#CD7F32"}
