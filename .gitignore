@@ -7,6 +7,9 @@ build/
 dist/
 *.spec
 
+# onedir 模式把运行库直接放在根目录时的运行时文件夹（随打包重新生成，不入库）
+/_internal/
+
 # ===== 打包好的 exe（20MB，统一作为 GitHub Release 附件分发，不进源码库） =====
 *.exe
 
